@@ -394,3 +394,122 @@ point with:
 ```bash
 python -m sglang_omni_router.serve --help
 ```
+
+## Troubleshooting
+
+### Worker Stuck in `unknown` State
+
+A worker starts in `unknown` and stays there until it passes
+`health_success_threshold` consecutive health checks. This is normal at
+startup. If a worker remains `unknown` beyond the expected startup window:
+
+1. Confirm the worker process is reachable on its port:
+   ```bash
+   curl -i http://127.0.0.1:8011/health
+   ```
+2. Check `last_error` in `/workers` for the exact connection failure:
+   ```bash
+   curl -s http://127.0.0.1:8008/workers | python3 -c "
+   import json, sys
+   for w in json.load(sys.stdin)['workers']:
+       print(w['display_id'], w['health_state'], w['last_error'])
+   "
+   ```
+3. Verify `--health-check-endpoint` matches the path the worker actually
+   serves (default `/health`).
+
+### Worker Stuck in `unhealthy` State
+
+An `unhealthy` worker re-enters the routable pool once it passes
+`health_success_threshold` consecutive health checks. If it does not recover:
+
+1. Check `last_error` and `consecutive_failures` via `/workers`.
+2. Confirm the worker process has not crashed:
+   ```bash
+   curl -i http://127.0.0.1:8011/health
+   ```
+3. To force a reset without restarting the router, quarantine the worker and
+   then clear the dead flag so health checks can re-qualify it:
+   ```bash
+   curl -s -X PUT http://127.0.0.1:8008/workers/http%3A%2F%2F127.0.0.1%3A8011 \
+     -H "Content-Type: application/json" -d '{"is_dead": true}'
+   curl -s -X PUT http://127.0.0.1:8008/workers/http%3A%2F%2F127.0.0.1%3A8011 \
+     -H "Content-Type: application/json" -d '{"is_dead": false}'
+   ```
+
+### Router Returns 503 on Every Request
+
+`503` means no worker is currently routable. Check `/workers` first:
+
+```bash
+curl -s http://127.0.0.1:8008/workers
+```
+
+Common causes:
+
+- **Workers still starting**: `routable_workers` is zero but `health_state`
+  values are `unknown`. Wait for the health check loop to qualify them, or
+  lower `--health-check-interval-secs` during debugging.
+- **All workers unhealthy**: `health_state` is `unhealthy` for every worker.
+  Check `last_error` per worker (see [Worker Stuck in unhealthy State](#worker-stuck-in-unhealthy-state)).
+- **Capability mismatch**: workers are routable but none supports the
+  capabilities the request requires. See
+  [Mixed-Capability Pool](#mixed-capability-pool-requests-always-return-503).
+
+### Mixed-Capability Pool: Requests Always Return 503
+
+When using `--worker-config` with heterogeneous workers, a request returns
+`503` if no routable worker declares all the capabilities the request needs.
+
+Inspect what each worker currently advertises:
+
+```bash
+curl -s http://127.0.0.1:8008/workers | python3 -c "
+import json, sys
+for w in json.load(sys.stdin)['workers']:
+    print(w['display_id'], w['routable'], sorted(w['capabilities']))
+"
+```
+
+To isolate whether the issue is capability routing or worker health, force a
+specific capability set with a request header and check whether the request
+succeeds:
+
+```bash
+curl http://127.0.0.1:8008/v1/chat/completions \
+  -H "X-SGLang-Omni-Route-Capabilities: chat" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen3-omni", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8}'
+```
+
+If this succeeds, the original request requires a capability that no worker
+declares. Update the worker `capabilities` list in `--worker-config` or the
+launcher `worker_capabilities` field to match what the workers actually
+support.
+
+### Draining a Worker Before Taking It Offline
+
+Disable the worker first so the router stops sending new requests to it, then
+wait for in-flight requests to finish before deleting it:
+
+```bash
+# Stop new requests from being routed to this worker
+curl -s -X PUT http://127.0.0.1:8008/workers/http%3A%2F%2F127.0.0.1%3A8013 \
+  -H "Content-Type: application/json" -d '{"disabled": true}'
+
+# Wait until active_requests reaches zero
+while true; do
+  active=$(curl -s http://127.0.0.1:8008/workers | python3 -c "
+import json, sys
+workers = json.load(sys.stdin)['workers']
+target = next((w for w in workers if '8013' in w['url']), None)
+print(target['active_requests'] if target else 0)
+")
+  echo "active_requests=$active"
+  [ "$active" = "0" ] && break
+  sleep 2
+done
+
+# Remove the worker entry and stop the worker process
+curl -s -X DELETE http://127.0.0.1:8008/workers/http%3A%2F%2F127.0.0.1%3A8013
+```
