@@ -53,12 +53,12 @@
     <link rel="icon" href="https://docs.sglang.io/_static/logo.ico"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="TTS Model Usage" href="tts_s2pro.html" />
+    <link rel="next" title="TTS Model Usage" href="tts.html" />
     <link rel="prev" title="🚀 Get Started" href="../get_started/installation.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.0" />
-    <meta name="docbuild:last-update" content="May 18, 2026"/>
+    <meta name="docbuild:last-update" content="May 23, 2026"/>
   </head>
   
   
@@ -158,7 +158,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Omni Model Usage</a></li>
-<li class="toctree-l1"><a class="reference internal" href="tts_s2pro.html">TTS Model Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tts.html">TTS Model Usage</a></li>
 <li class="toctree-l1"><a class="reference internal" href="omni_router.html">Omni Router Usage</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
@@ -452,6 +452,16 @@ uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </s
 <span class="w">  </span>--port<span class="w"> </span><span class="m">8008</span>
 </pre></div>
 </div>
+<p>For MMSU-style audio-input / text-output benchmarks with short requests, use
+the fused text-path config so the full text path stays inside one worker
+process:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-path<span class="w"> </span>Qwen/Qwen3-Omni-30B-A3B-Instruct<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/qwen3_omni_mmsu.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--text-only<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--port<span class="w"> </span><span class="m">8008</span>
+</pre></div>
+</div>
 </section>
 <section id="image-and-text-input">
 <h3>Image and Text Input<a class="headerlink" href="#image-and-text-input" title="Link to this heading">#</a></h3>
@@ -571,7 +581,16 @@ instructions in the text message.</p>
 <p>Speech mode runs the full 9-stage pipeline across multiple GPUs. It produces both text (from the thinker) and audio (from the talker) output.</p>
 <section id="id1">
 <h3>Launch the Server<a class="headerlink" href="#id1" title="Link to this heading">#</a></h3>
-<p>Speech mode requires multiple GPUs. Use the example script with GPU placement control:</p>
+<p>Speech mode can run as a colocated one-GPU worker using the colocated config:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-path<span class="w"> </span>Qwen/Qwen3-Omni-30B-A3B-Instruct<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/qwen3_omni_colocated_h20.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--colocate<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--port<span class="w"> </span><span class="m">8008</span>
+</pre></div>
+</div>
+<p>Use <code class="docutils literal notranslate"><span class="pre">examples/configs/qwen3_omni_colocated_h200.yaml</span></code> on single-H200 workers.</p>
+<p>For manual multi-GPU placement, use the example script:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>examples/run_qwen3_omni_speech_server.py<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--model-path<span class="w"> </span>Qwen/Qwen3-Omni-30B-A3B-Instruct<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--gpu-thinker<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
@@ -581,7 +600,7 @@ instructions in the text message.</p>
 <span class="w">  </span>--port<span class="w"> </span><span class="m">8008</span>
 </pre></div>
 </div>
-<p>Or use the CLI without <code class="docutils literal notranslate"><span class="pre">--text-only</span></code> (defaults to speech mode):</p>
+<p>Or use the CLI without <code class="docutils literal notranslate"><span class="pre">--text-only</span></code> for the standard speech pipeline:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--model-path<span class="w"> </span>Qwen/Qwen3-Omni-30B-A3B-Instruct<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--port<span class="w"> </span><span class="m">8008</span>
@@ -862,7 +881,7 @@ the global value for that stage. Values must be greater than <code class="docuti
       </div>
     </a>
     <a class="right-next"
-       href="tts_s2pro.html"
+       href="tts.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
@@ -937,7 +956,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on May 18, 2026.
+  Last updated on May 23, 2026.
   <br/>
 </p>
   </div>
