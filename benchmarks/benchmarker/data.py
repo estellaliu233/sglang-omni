@@ -17,6 +17,8 @@ class RequestResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     engine_time_s: float = 0.0
+    cached_tokens: int = 0
+    cache_hit_rate: float = 0.0
     tok_per_s: float = 0.0
     wav_path: str = ""
     error: str = ""

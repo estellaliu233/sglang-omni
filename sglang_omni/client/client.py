@@ -283,6 +283,10 @@ class Client:
                 usage["total_tokens"] = (prompt_tokens or 0) + (completion_tokens or 0)
         if "engine_time_s" not in usage and data.get("engine_time_s") is not None:
             usage["engine_time_s"] = data.get("engine_time_s")
+        if "cached_tokens" not in usage and data.get("cached_tokens") is not None:
+            usage["cached_tokens"] = data.get("cached_tokens")
+        if "cache_hit_rate" not in usage and data.get("cache_hit_rate") is not None:
+            usage["cache_hit_rate"] = data.get("cache_hit_rate")
         return UsageInfo.from_dict(usage)
 
     @staticmethod

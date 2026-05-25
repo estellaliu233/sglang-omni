@@ -242,12 +242,14 @@ class ProfilerStartMessage:
 
     run_id: str
     trace_path_template: str  # e.g. "/tmp/profiles/{run_id}/{stage}/trace"
+    config: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "type": "profiler_start",
             "run_id": self.run_id,
             "trace_path_template": self.trace_path_template,
+            "config": self.config,
         }
 
     @classmethod
@@ -255,6 +257,7 @@ class ProfilerStartMessage:
         return cls(
             run_id=d["run_id"],
             trace_path_template=d["trace_path_template"],
+            config=d.get("config"),
         )
 
 
