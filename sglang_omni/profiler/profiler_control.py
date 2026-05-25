@@ -48,8 +48,7 @@ class ProfilerControlClient:
         assert self._socks is not None
         targets = stages or list(self._socks.keys())
         msg = ProfilerStartMessage(
-            run_id=run_id,
-            trace_path_template=trace_path_template,
+            run_id=run_id, trace_path_template=trace_path_template
         )
         for s in targets:
             sock = self._socks.get(s)
