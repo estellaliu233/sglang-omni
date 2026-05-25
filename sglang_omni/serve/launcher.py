@@ -151,12 +151,10 @@ class StartReq(BaseModel):
     run_id: str | None = None
     trace_path_template: str | None = None
     config: dict[str, Any] | None = None
-    stages: list[str] | None = None
 
 
 class StopReq(BaseModel):
     run_id: str | None = None
-    stages: list[str] | None = None
 
 
 def _mount_profiler_routes(
@@ -183,14 +181,13 @@ def _mount_profiler_routes(
             run_id=run_id,
             trace_path_template=tpl,
             config=req.config,
-            stages=req.stages,
         )
         return {"run_id": run_id, "trace_path_template": tpl}
 
     @router.post("/stop_profile")
     async def stop(req: StopReq):
         run_id = req.run_id or "default"
-        await profiler_ctl.broadcast_stop(run_id=run_id, stages=req.stages)
+        await profiler_ctl.broadcast_stop(run_id=run_id)
         return {"run_id": run_id}
 
     app.include_router(router)

@@ -466,8 +466,6 @@ async def _start_profile(args: argparse.Namespace) -> tuple[str, dict] | None:
         body["trace_path_template"] = _default_profile_template(
             args.profile_output_dir, run_id
         )
-    if args.profile_stages:
-        body["stages"] = args.profile_stages
     result = await _post_profile_control(
         base_url=base_url,
         endpoint="start_profile",
@@ -484,8 +482,6 @@ async def _stop_profile(
         return
     run_id, start_body = started
     body: dict = {"run_id": run_id}
-    if start_body.get("stages"):
-        body["stages"] = start_body["stages"]
     base_url = build_base_url(_config_from_args(args))
     result = await _post_profile_control(
         base_url=base_url,
@@ -557,16 +553,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional profiler run id. Defaults to a higgs_tts_<uuid> value.",
     )
-    parser.add_argument(
-        "--profile-stages",
-        nargs="+",
-        default=None,
-        help=(
-            "Optional stage names to profile, e.g. preprocessing audio_encoder "
-            "tts_engine vocoder. Defaults to all stages."
-        ),
-    )
-
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--generate-only", action="store_true")
     mode.add_argument("--transcribe-only", action="store_true")
