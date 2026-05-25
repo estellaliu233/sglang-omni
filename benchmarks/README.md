@@ -173,7 +173,7 @@ available.
 | Model | Config | wer_corpus | wer_per_sample_mean | latency_mean_s | latency_p95_s | rtf_mean | throughput_qps | evaluated | Source |
 |-------|--------|------------|---------------------|----------------|---------------|----------|----------------|-----------|--------|
 | Higgs TTS | EN, stream=False, CUDA Graph on, torch.compile off, subset=50 | 1.06% | 0.91% | 2.236 | 3.179 | 0.598 | 6.535 | 50/50 | local H200 run, c=16 |
-| Higgs TTS | ZH, stream=False, CUDA Graph on, torch.compile off | TBD | TBD | TBD | TBD | TBD | TBD | TBD | local full/subset run |
+| Higgs TTS | ZH, stream=False, CUDA Graph on, torch.compile off, subset=50 | 0.43% | 0.37% | 2.090 | 3.386 | 0.388 | 7.120 | 50/50 | local H200 run, c=16 |
 
 ## Adding a New Model or Task
 
