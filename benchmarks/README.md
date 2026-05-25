@@ -166,14 +166,22 @@ CUDA Graph enabled and does not enable `torch.compile`; use
 `examples/configs/higgs_tts_cg_off.yaml` only when explicitly measuring the
 CUDA Graph off ablation.
 
-Do not mix numbers from CUDA-Graph-off or torch.compile-enabled runs. Mark
-subset runs explicitly; full-set numbers should replace subset rows when
-available.
+Do not mix numbers from CUDA-Graph-off or torch.compile-enabled runs. The
+Higgs rows below are full-set local H200 results with CUDA Graph on and
+`torch.compile` off. S2-Pro rows are copied from the H200 full-set reference
+results in `eval/benchmark_tts_seedtts.py` for comparison.
 
-| Model | Config | wer_corpus | wer_per_sample_mean | latency_mean_s | latency_p95_s | rtf_mean | throughput_qps | evaluated | Source |
-|-------|--------|------------|---------------------|----------------|---------------|----------|----------------|-----------|--------|
-| Higgs TTS | EN, stream=False, CUDA Graph on, torch.compile off, subset=50 | 1.06% | 0.91% | 2.236 | 3.179 | 0.598 | 6.535 | 50/50 | local H200 run, c=16 |
-| Higgs TTS | ZH, stream=False, CUDA Graph on, torch.compile off, subset=50 | 0.43% | 0.37% | 2.090 | 3.386 | 0.388 | 7.120 | 50/50 | local H200 run, c=16 |
+| Model | Config | wer_corpus | wer_corpus_excl_>50 | wer_per_sample_mean | latency_mean_s | latency_p95_s | rtf_mean | throughput_qps | evaluated | Source |
+|-------|--------|------------|---------------------|---------------------|----------------|---------------|----------|----------------|-----------|--------|
+| Higgs TTS | EN, stream=False, CUDA Graph on, torch.compile off, full set | 4.68% | 1.36% | 4.16% | 1.749 | 2.600 | 0.425 | 9.104 | 1088/1088 | local H200 run, c=16; 2 samples >50% WER |
+| Higgs TTS | ZH, stream=False, CUDA Graph on, torch.compile off, full set | 1.14% | 1.14% | 1.08% | 1.629 | 2.110 | 0.282 | 9.792 | 2020/2020 | local H200 run, c=16 |
+| S2-Pro | EN, stream=False, full set | 1.07% | - | 1.03% | 15.836 | 21.509 | 4.269 | 1.005 | 1088/1088 | PR #411 H200 reference, c=16 |
+| S2-Pro | ZH, stream=False, full set | 1.02% | - | 0.98% | 16.114 | 20.092 | 3.018 | 0.990 | 2020/2020 | PR #411 H200 reference, c=16 |
+
+For EN, the raw Higgs corpus WER is dominated by two outlier samples above 50%
+WER; `wer_corpus_excl_>50` reports the benchmark's outlier-excluded corpus WER.
+Other model reference rows are not duplicated here; see
+`eval/benchmark_tts_seedtts.py` for the full S2-Pro H200/H100 reference table.
 
 ## Adding a New Model or Task
 
