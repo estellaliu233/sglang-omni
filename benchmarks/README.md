@@ -34,6 +34,12 @@ python -m sglang_omni.cli serve \
 python -m sglang_omni.cli serve \
     --model-path mistralai/Voxtral-4B-TTS-2603 --port 8000
 
+# Higgs TTS — for section 2e (voice cloning via references[])
+# This config has CUDA Graph enabled and does not enable torch.compile.
+python -m sglang_omni.cli serve \
+    --model-path boson-sglang/higgs-audio-v3-tts-4b-base \
+    --config examples/configs/higgs_tts.yaml --port 8000
+
 # Qwen3-Omni, speech mode — for section 3 (SeedTTS; multi-GPU)
 python -m sglang_omni.cli serve \
     --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8000
@@ -68,6 +74,13 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
     --max-concurrency 16 \
     --output-dir results/voxtral_en --lang en --max-samples 50 \
     --no-ref-audio --voice cheerful_female
+
+# 2e. Higgs TTS — full pipeline with SeedTTS voice-cloning references
+python -m benchmarks.eval.benchmark_tts_seedtts \
+    --meta zhaochenyang20/seed-tts-eval-arrow \
+    --model boson-sglang/higgs-audio-v3-tts-4b-base --port 8000 \
+    --max-concurrency 16 \
+    --output-dir results/higgs_tts_en --lang en --max-samples 50
 
 # 3a. Qwen3-Omni — full pipeline (generate + transcribe)
 python -m benchmarks.eval.benchmark_omni_seedtts \
@@ -124,7 +137,7 @@ python -m benchmarks.eval.benchmark_omni_videoamme \
 
 | Script | Task | Model | API |
 |--------|------|-------|-----|
-| `eval/benchmark_tts_seedtts.py` | TTS speed + WER (unified) | e.g. S2-Pro, Voxtral | `/v1/audio/speech` |
+| `eval/benchmark_tts_seedtts.py` | TTS speed + WER (unified) | e.g. S2-Pro, Voxtral, Higgs TTS | `/v1/audio/speech` |
 | `eval/benchmark_omni_seedtts.py` | TTS speed + WER (unified) | Qwen3-Omni | `/v1/chat/completions` |
 | `eval/benchmark_omni_mmsu.py` | MMSU (audio comprehension) | Qwen3-Omni | `/v1/chat/completions` |
 | `eval/benchmark_omni_mmmu.py` | MMMU (VLM accuracy + speed) | Qwen3-Omni | `/v1/chat/completions` |
@@ -137,8 +150,29 @@ generates + persists WAVs while the server runs, phase 2 transcribes offline
 to avoid GPU contention with the server. Use `--generate-only` or
 `--transcribe-only` to run a single phase. For TTS, `--concurrency` and
 `--max-concurrency` are equivalent (see `benchmark_tts_seedtts.py`).
+`benchmark_tts_seedtts.py` also handles model-specific voice-cloning reference
+payloads: `--ref-format flat` sends `ref_audio`/`ref_text`,
+`--ref-format references` sends `references=[{audio_path, text}]`, and the
+default `--ref-format auto` selects `references` for Higgs models.
 `benchmark_omni_seedtts.py` documents local vs CI GPU usage in its module
 docstring (sequential phases on CI to reduce OOM risk).
+
+
+## Higgs TTS SeedTTS Results
+
+Use the general `eval/benchmark_tts_seedtts.py` entry point for Higgs TTS. The
+reference Higgs server config is `examples/configs/higgs_tts.yaml`, which keeps
+CUDA Graph enabled and does not enable `torch.compile`; use
+`examples/configs/higgs_tts_cg_off.yaml` only when explicitly measuring the
+CUDA Graph off ablation.
+
+Fill this table only after a completed run. Do not mix numbers from
+CUDA-Graph-off or torch.compile-enabled runs.
+
+| Model | Config | wer_corpus | wer_per_sample_mean | latency_mean_s | latency_p95_s | rtf_mean | throughput_qps | evaluated | Source |
+|-------|--------|------------|---------------------|----------------|---------------|----------|----------------|-----------|--------|
+| Higgs TTS | EN, stream=False, CUDA Graph on, torch.compile off | TBD | TBD | TBD | TBD | TBD | TBD | TBD | local full/subset run |
+| Higgs TTS | ZH, stream=False, CUDA Graph on, torch.compile off | TBD | TBD | TBD | TBD | TBD | TBD | TBD | local full/subset run |
 
 ## Adding a New Model or Task
 
