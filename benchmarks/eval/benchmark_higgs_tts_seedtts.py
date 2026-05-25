@@ -174,22 +174,12 @@ def _successful_metric(outputs: Iterable[RequestResult], attr: str) -> list[floa
     return values
 
 
-def _successful_metric_including_zero(
-    outputs: Iterable[RequestResult], attr: str
-) -> list[float]:
-    return [
-        float(getattr(output, attr, 0.0) or 0.0)
-        for output in outputs
-        if output.is_success
-    ]
-
-
 def _mean_or_zero(values: list[float]) -> float:
     return round(mean(values), 6) if values else 0.0
 
 
-def _cache_hit_count(outputs: Iterable[RequestResult]) -> int:
-    return sum(1 for output in outputs if output.is_success and output.cached_tokens > 0)
+def _successful_count(outputs: Iterable[RequestResult]) -> int:
+    return sum(1 for output in outputs if output.is_success)
 
 
 def _summary(
@@ -204,23 +194,12 @@ def _summary(
     hit_latency = _successful_metric(hit_measured, "latency_s")
     miss_engine = _successful_metric(miss_outputs, "engine_time_s")
     hit_engine = _successful_metric(hit_measured, "engine_time_s")
-    miss_cached_tokens = _successful_metric_including_zero(
-        miss_outputs, "cached_tokens"
-    )
-    hit_cached_tokens = _successful_metric_including_zero(
-        hit_measured, "cached_tokens"
-    )
-    miss_cache_hit_rate = _successful_metric_including_zero(
-        miss_outputs, "cache_hit_rate"
-    )
-    hit_cache_hit_rate = _successful_metric_including_zero(
-        hit_measured, "cache_hit_rate"
-    )
 
     miss_latency_mean = _mean_or_zero(miss_latency)
     hit_latency_mean = _mean_or_zero(hit_latency)
     miss_engine_mean = _mean_or_zero(miss_engine)
     hit_engine_mean = _mean_or_zero(hit_engine)
+    hit_expected_cache_hits = _successful_count(hit_measured)
 
     return {
         "concurrency": concurrency,
@@ -229,22 +208,14 @@ def _summary(
         "hit_cold_excluded": hit_cold_count,
         "miss_failed": sum(not o.is_success for o in miss_outputs),
         "hit_failed": sum(not o.is_success for o in hit_measured),
-        "miss_cache_hits": _cache_hit_count(miss_outputs),
-        "hit_cache_hits": _cache_hit_count(hit_measured),
-        "miss_request_cache_hit_rate": round(
-            _cache_hit_count(miss_outputs) / len(miss_outputs), 6
-        )
-        if miss_outputs
-        else 0.0,
-        "hit_request_cache_hit_rate": round(
-            _cache_hit_count(hit_measured) / len(hit_measured), 6
+        "miss_expected_cache_hits": 0,
+        "hit_expected_cache_hits": hit_expected_cache_hits,
+        "miss_expected_request_cache_hit_rate": 0.0,
+        "hit_expected_request_cache_hit_rate": round(
+            hit_expected_cache_hits / len(hit_measured), 6
         )
         if hit_measured
         else 0.0,
-        "miss_cached_tokens_mean": _mean_or_zero(miss_cached_tokens),
-        "hit_cached_tokens_mean": _mean_or_zero(hit_cached_tokens),
-        "miss_token_cache_hit_rate_mean": _mean_or_zero(miss_cache_hit_rate),
-        "hit_token_cache_hit_rate_mean": _mean_or_zero(hit_cache_hit_rate),
         "miss_latency_mean_s": miss_latency_mean,
         "hit_latency_mean_s": hit_latency_mean,
         "latency_saved_s": round(miss_latency_mean - hit_latency_mean, 6)
@@ -270,6 +241,7 @@ def _row(scenario: str, index: int, output: RequestResult, *, is_cold: bool) -> 
         "request_index": index,
         "id": output.request_id,
         "is_cold": is_cold,
+        "expected_cache_hit": scenario == "same_ref_hit" and not is_cold,
         "is_success": output.is_success,
         "latency_s": round(output.latency_s, 6),
         "engine_time_s": round(output.engine_time_s, 6)
@@ -279,8 +251,6 @@ def _row(scenario: str, index: int, output: RequestResult, *, is_cold: bool) -> 
         "rtf": round(output.rtf, 6) if output.rtf < float("inf") else None,
         "prompt_tokens": output.prompt_tokens or None,
         "completion_tokens": output.completion_tokens or None,
-        "cached_tokens": output.cached_tokens,
-        "cache_hit_rate": round(output.cache_hit_rate, 6),
         "tok_per_s": round(output.tok_per_s, 6) if output.tok_per_s > 0 else None,
         "wav_path": output.wav_path or None,
         "error": output.error or None,
@@ -429,14 +399,16 @@ def print_cache_summary(summary: dict) -> None:
     print(f"  Miss samples:                {summary['miss_samples']}")
     print(f"  Hit samples:                 {summary['hit_samples']}")
     print(f"  Hit cold excluded:           {summary['hit_cold_excluded']}")
-    print(f"  Miss cache-hit requests:     {summary['miss_cache_hits']}")
-    print(f"  Hit cache-hit requests:      {summary['hit_cache_hits']}")
-    print(f"  Miss request hit rate:       {summary['miss_request_cache_hit_rate']}")
-    print(f"  Hit request hit rate:        {summary['hit_request_cache_hit_rate']}")
-    print(f"  Miss cached tokens mean:     {summary['miss_cached_tokens_mean']}")
-    print(f"  Hit cached tokens mean:      {summary['hit_cached_tokens_mean']}")
-    print(f"  Miss token hit rate mean:    {summary['miss_token_cache_hit_rate_mean']}")
-    print(f"  Hit token hit rate mean:     {summary['hit_token_cache_hit_rate_mean']}")
+    print(f"  Miss expected cache hits:    {summary['miss_expected_cache_hits']}")
+    print(f"  Hit expected cache hits:     {summary['hit_expected_cache_hits']}")
+    print(
+        "  Miss expected hit rate:      "
+        f"{summary['miss_expected_request_cache_hit_rate']}"
+    )
+    print(
+        "  Hit expected hit rate:       "
+        f"{summary['hit_expected_request_cache_hit_rate']}"
+    )
     print(f"  Miss latency mean (s):       {summary['miss_latency_mean_s']}")
     print(f"  Hit latency mean (s):        {summary['hit_latency_mean_s']}")
     print(f"  Latency saved (s):           {summary['latency_saved_s']}")

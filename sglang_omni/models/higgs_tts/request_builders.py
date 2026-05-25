@@ -102,9 +102,6 @@ def apply_higgs_result(state: HiggsTtsState, data: HiggsSGLangRequestData) -> No
     else:
         state.output_codes_delayed = None
     state.prompt_tokens = len(data.input_ids)
-    state.cached_tokens = int(getattr(data.req, "cached_tokens", 0) or 0)
-    if state.prompt_tokens:
-        state.cache_hit_rate = state.cached_tokens / state.prompt_tokens
 
 
 def make_higgs_scheduler_adapters():

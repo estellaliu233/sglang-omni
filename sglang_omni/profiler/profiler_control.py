@@ -42,6 +42,7 @@ class ProfilerControlClient:
         self,
         run_id: str,
         trace_path_template: str,
+        config: dict[str, Any] | None = None,
         stages: list[str] | None = None,
     ) -> None:
         await self.start()

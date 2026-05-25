@@ -1013,18 +1013,12 @@ def _parse_response_headers(result: RequestResult, headers: dict) -> None:
     prompt_tok = headers.get("X-Prompt-Tokens")
     comp_tok = headers.get("X-Completion-Tokens")
     eng_time = headers.get("X-Engine-Time")
-    cached_tok = headers.get("X-Cached-Tokens")
-    cache_hit_rate = headers.get("X-Cache-Hit-Rate")
     if prompt_tok is not None:
         result.prompt_tokens = int(prompt_tok)
     if comp_tok is not None:
         result.completion_tokens = int(comp_tok)
     if eng_time is not None:
         result.engine_time_s = float(eng_time)
-    if cached_tok is not None:
-        result.cached_tokens = int(cached_tok)
-    if cache_hit_rate is not None:
-        result.cache_hit_rate = float(cache_hit_rate)
     if result.completion_tokens > 0 and result.engine_time_s > 0:
         result.tok_per_s = result.completion_tokens / result.engine_time_s
 
@@ -1071,18 +1065,12 @@ async def _handle_streaming_response(
         prompt_tok = usage_data.get("prompt_tokens")
         comp_tok = usage_data.get("completion_tokens")
         eng_time = usage_data.get("engine_time_s")
-        cached_tok = usage_data.get("cached_tokens")
-        cache_hit_rate = usage_data.get("cache_hit_rate")
         if prompt_tok is not None:
             result.prompt_tokens = int(prompt_tok)
         if comp_tok is not None:
             result.completion_tokens = int(comp_tok)
         if eng_time is not None:
             result.engine_time_s = float(eng_time)
-        if cached_tok is not None:
-            result.cached_tokens = int(cached_tok)
-        if cache_hit_rate is not None:
-            result.cache_hit_rate = float(cache_hit_rate)
         if result.completion_tokens > 0 and result.engine_time_s > 0:
             result.tok_per_s = result.completion_tokens / result.engine_time_s
 
