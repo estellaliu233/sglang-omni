@@ -7,6 +7,9 @@ Note (Qiujiang, Chenyang):
   ref_text from the meta file.
 2. Plain TTS (e.g. mistralai/Voxtral-4B-TTS-2603): use --no-ref-audio and
   --voice for a server-side speaker preset.
+3. Higgs TTS uses the same benchmark. The payload builder auto-sends
+  references=[{audio_path, text}] for Higgs models; use --ref-format to
+  override if needed.
 
 Usage:
 
@@ -24,6 +27,12 @@ Usage:
         --model-path mistralai/Voxtral-4B-TTS-2603 \
         --port 8000
 
+    3. For Higgs TTS:
+    python -m sglang_omni.cli serve \
+        --model-path boson-sglang/higgs-audio-v3-tts-4b-base \
+        --config examples/configs/higgs_tts.yaml \
+        --port 8000
+
     # Full pipeline (generate + transcribe) — voice cloning
     python -m benchmarks.eval.benchmark_tts_seedtts \
         --meta zhaochenyang20/seed-tts-eval-arrow \
@@ -36,6 +45,13 @@ Usage:
         --model mistralai/Voxtral-4B-TTS-2603 --port 8000 \
         --max-concurrency 16 \
         --no-ref-audio --voice cheerful_female --max-samples 50
+
+    # Full pipeline — Higgs TTS voice cloning
+    python -m benchmarks.eval.benchmark_tts_seedtts \
+        --meta zhaochenyang20/seed-tts-eval-arrow \
+        --model boson-sglang/higgs-audio-v3-tts-4b-base --port 8000 \
+        --output-dir results/higgs_tts_en \
+        --lang en --max-concurrency 16
 
 For CI settings, separate the generate and transcribe phases into two runs.
 
@@ -164,6 +180,9 @@ class TtsSeedttsBenchmarkConfig:
     # seed-tts-eval reference audio.  The ``--no-ref-audio`` CLI flag flips
     # this to False for plain TTS models that do not accept ref audio.
     voice_clone: bool = True
+    # Reference payload shape for voice cloning. "auto" preserves the flat
+    # ref_audio/ref_text fields for most models and uses references[] for Higgs.
+    ref_format: str = "auto"
     output_dir: str = "results/tts_seedtts"
     max_samples: int | None = None
     max_new_tokens: int | None = 2048
@@ -197,6 +216,14 @@ def _build_generation_kwargs(config: TtsSeedttsBenchmarkConfig) -> dict:
     return generation_kwargs
 
 
+def _resolve_ref_format(config: TtsSeedttsBenchmarkConfig) -> str:
+    if config.ref_format != "auto":
+        return config.ref_format
+    if "higgs" in config.model.lower():
+        return "references"
+    return "flat"
+
+
 def _build_results_config(
     config: TtsSeedttsBenchmarkConfig,
     *,
@@ -207,6 +234,7 @@ def _build_results_config(
         "base_url": base_url,
         "meta": config.meta,
         "voice_clone": config.voice_clone,
+        "ref_format": _resolve_ref_format(config),
         "voice": config.voice,
         "stream": config.stream,
         "max_samples": config.max_samples,
@@ -239,6 +267,7 @@ async def run_tts_seedtts_benchmark(
         api_url,
         stream=config.stream,
         no_ref_audio=not config.voice_clone,
+        ref_format=_resolve_ref_format(config),
         voice=config.voice,
         save_audio_dir=save_audio_dir,
         **generation_kwargs,
@@ -274,6 +303,7 @@ def run_tts_seedtts_transcribe(config: TtsSeedttsBenchmarkConfig) -> dict:
         "model": config.model,
         "meta": config.meta,
         "voice_clone": config.voice_clone,
+        "ref_format": _resolve_ref_format(config),
         "voice": config.voice,
         "max_new_tokens": config.max_new_tokens,
         "temperature": config.temperature,
@@ -300,6 +330,7 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
         meta=args.meta,
         voice=args.voice,
         voice_clone=voice_clone,
+        ref_format=args.ref_format,
         output_dir=args.output_dir,
         max_samples=args.max_samples,
         max_new_tokens=args.max_new_tokens,
@@ -367,6 +398,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         dest="no_ref_audio",
         action="store_true",
         help="Skip ref audio/text from testset (TTS without voice cloning).",
+    )
+    parser.add_argument(
+        "--ref-format",
+        choices=["auto", "flat", "references"],
+        default="auto",
+        help=(
+            "Reference payload shape for voice cloning. 'flat' sends "
+            "ref_audio/ref_text, 'references' sends references=[{audio_path, "
+            "text}], and 'auto' uses references for Higgs models and flat "
+            "fields otherwise."
+        ),
     )
     parser.add_argument("--output-dir", type=str, default="results/tts_seedtts")
     parser.add_argument("--max-samples", type=int, default=None)
