@@ -48,7 +48,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 CONCURRENCY = 16
 MAX_SAMPLES = 50
-DATASET_CACHE_ENV = "SGLANG_SEEDTTS50_DIR"
 # Optional user override: a path to a custom fine-tuned WavLM checkpoint.
 # When unset, the bootstrapper in benchmarks.metrics.speaker_similarity_assets
 # auto-downloads the official weights into the shared cache directory.
@@ -78,7 +77,7 @@ VC_SIMILARITY_MEAN_MIN = 60.0
 _VC_NON_STREAM_P95 = {
     16: {
         "throughput_qps": 6.187,
-        "tok_per_s_agg": 6.1,
+        "output_tok_per_req_s": 6.1,
         "latency_mean_s": 2.418,
         "rtf_mean": 0.7912,
     },
@@ -86,10 +85,15 @@ _VC_NON_STREAM_P95 = {
 
 
 # Slack factors applied to P95 reference values to derive CI thresholds.
-# Higher-is-better metrics (throughput): threshold = P95 x slack_higher
+# Higher-is-better metrics (throughput, output tok/req-s): threshold = P95 x slack_higher
 # Lower-is-better metrics (latency, rtf): threshold = P95 x slack_lower
 
+QWEN3_OMNI_SEEDTTS_RTF_MEAN_MAX = 0.95
 VC_NON_STREAM_THRESHOLDS = apply_slack(_VC_NON_STREAM_P95)
+VC_NON_STREAM_THRESHOLDS[CONCURRENCY]["rtf_mean_max"] = min(
+    VC_NON_STREAM_THRESHOLDS[CONCURRENCY]["rtf_mean_max"],
+    QWEN3_OMNI_SEEDTTS_RTF_MEAN_MAX,
+)
 
 
 def _run_benchmark(
@@ -117,7 +121,7 @@ def _run_benchmark(
 
 
 def _run_wer_transcribe(
-    meta_path: str,
+    meta: str,
     output_dir: str,
     lang: str = "en",
     device: str = "cuda:0",
@@ -135,7 +139,7 @@ def _run_wer_transcribe(
         "benchmarks.eval.benchmark_omni_seedtts",
         "--transcribe-only",
         "--meta",
-        meta_path,
+        meta,
         "--output-dir",
         output_dir,
         "--model",
@@ -191,7 +195,7 @@ def _run_wer_transcribe(
 
 
 def _run_similarity(
-    meta_path: str,
+    meta: str,
     output_dir: str,
     checkpoint_path: str | None,
     *,
@@ -204,7 +208,7 @@ def _run_similarity(
         "benchmarks.eval.benchmark_omni_seedtts",
         "--similarity-only",
         "--meta",
-        meta_path,
+        meta,
         "--output-dir",
         output_dir,
         "--model",
@@ -273,14 +277,10 @@ def _assert_similarity_results(
 
 
 @pytest.fixture(scope="module")
-def dataset_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    override_dir = os.environ.get(DATASET_CACHE_ENV)
-    if override_dir:
-        root = Path(override_dir).expanduser()
-    else:
-        root = tmp_path_factory.mktemp("seed_tts_eval") / "data"
-    download_dataset(DATASETS["seedtts-50"], str(root), quiet=True)
-    return root
+def dataset_repo() -> str:
+    repo_id = DATASETS["seedtts-50"]
+    download_dataset(repo_id, quiet=True)
+    return repo_id
 
 
 @pytest.fixture(scope="module")
@@ -310,7 +310,7 @@ class _SpeedArtifacts:
 @pytest.fixture(scope="module")
 def speed_artifacts(
     qwen3_omni_router_server: ManagedRouterHandle,
-    dataset_dir: Path,
+    dataset_repo: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> _SpeedArtifacts:
     """Run the speed benchmark once and expose its artifacts."""
@@ -327,7 +327,7 @@ def speed_artifacts(
 
         results = _run_benchmark(
             qwen3_omni_router_server.port,
-            str(dataset_dir / "en" / "meta.lst"),
+            dataset_repo,
             output_dir,
         )
     except Exception:
@@ -410,10 +410,10 @@ def test_voice_cloning_non_streaming(
 def test_voice_cloning_wer(
     qwen3_omni_router_server: ManagedRouterHandle,
     wer_audio_dir: str,
-    dataset_dir: Path,
+    dataset_repo: str,
 ) -> None:
     results = _run_wer_transcribe(
-        str(dataset_dir / "en" / "meta.lst"),
+        dataset_repo,
         wer_audio_dir,
     )
     print_wer_summary(results["summary"], "qwen3-omni")
@@ -431,7 +431,7 @@ def test_voice_cloning_wer(
 @pytest.mark.benchmark
 def test_voice_cloning_similarity(
     wer_audio_dir: str,
-    dataset_dir: Path,
+    dataset_repo: str,
     similarity_checkpoint: str | None,
 ) -> None:
     """Speaker similarity for Qwen3-Omni voice-clone output.
@@ -449,7 +449,7 @@ def test_voice_cloning_similarity(
     ``_assert_similarity_results(results, VC_SIMILARITY_MEAN_MIN)``.
     """
     results = _run_similarity(
-        str(dataset_dir / "en" / "meta.lst"),
+        dataset_repo,
         wer_audio_dir,
         similarity_checkpoint,
     )

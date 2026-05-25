@@ -36,12 +36,15 @@ tests/
     │   ├── test_code2wav.py
     │   ├── test_colocation_config.py
     │   ├── test_config_manager.py
+    │   ├── test_fp8_backend_config.py
     │   ├── test_example_launcher.py
     │   ├── test_logit_shaping.py
     │   ├── test_pipeline.py
+    │   ├── test_quantization.py
     │   ├── test_sglang_ar_budget.py
     │   ├── test_streaming.py
-    │   └── test_talker.py
+    │   ├── test_talker.py
+    │   └── test_text_template.py
     ├── ming_omni/
     │   ├── test_pipeline.py
     │   ├── test_talker.py
@@ -50,6 +53,10 @@ tests/
     │   └── test_tp.py
     ├── qwen3_tts/
     │   └── test_pipeline.py
+    ├── higgs_tts/
+    │   ├── test_batched_step.py
+    │   ├── test_pipeline.py
+    │   └── test_request_builders.py
     ├── router/
     │   ├── test_app.py
     │   └── test_core.py
@@ -189,6 +196,8 @@ that happened to contain an older version of the test.
   - public CLI/config behavior
   - example launcher config contract (TP/GPU/mem-fraction overrides)
   - SGLang argument builders
+  - backend policy and quantization compatibility contracts
+  - tokenizer and preprocessing fallback behavior
   - memory flag contracts
   - colocation config and SGLang AR budget contracts
   - `PipelineState` request builders
@@ -219,6 +228,12 @@ that happened to contain an older version of the test.
   - voice-clone reference validation
   - pipeline payload state serialization.
 
+- `unit_test/higgs_tts/`: Higgs TTS unit tests:
+  - OmniScheduler-backed AR stage factory wiring
+  - sampler-driven finish handling for eager and CUDA-graph paths
+  - request builder sampling normalization and server-side token caps
+  - model slot cleanup and engine timing in scheduler result adapters.
+
 - `unit_test/router/`: SGLang-Omni Router unit tests:
   - router CLI/config behavior
   - worker metadata and health-state contracts
@@ -242,6 +257,12 @@ that happened to contain an older version of the test.
   - current `StageConfig` schema wiring
   - SGLang-backed generation and vocoder GPU placement contracts
   - terminal stage behavior.
+
+- `unit_test/profiler/`: Request-level profiler unit tests:
+  - `RequestEvent` schema and JSONL emit/append behavior
+  - concurrent emit safety under multiple threads
+  - lifecycle (start / stop / run_id mismatch / stage substitution)
+  - timeline reconstruction, stage breakdown, hop breakdown, malformed-line tolerance.
 
 - `unit_test/fixtures/`: Shared fakes. Single-test
   helpers should stay local until a second test needs them.
