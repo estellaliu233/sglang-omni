@@ -166,12 +166,13 @@ CUDA Graph enabled and does not enable `torch.compile`; use
 `examples/configs/higgs_tts_cg_off.yaml` only when explicitly measuring the
 CUDA Graph off ablation.
 
-Fill this table only after a completed run. Do not mix numbers from
-CUDA-Graph-off or torch.compile-enabled runs.
+Do not mix numbers from CUDA-Graph-off or torch.compile-enabled runs. Mark
+subset runs explicitly; full-set numbers should replace subset rows when
+available.
 
 | Model | Config | wer_corpus | wer_per_sample_mean | latency_mean_s | latency_p95_s | rtf_mean | throughput_qps | evaluated | Source |
 |-------|--------|------------|---------------------|----------------|---------------|----------|----------------|-----------|--------|
-| Higgs TTS | EN, stream=False, CUDA Graph on, torch.compile off | TBD | TBD | TBD | TBD | TBD | TBD | TBD | local full/subset run |
+| Higgs TTS | EN, stream=False, CUDA Graph on, torch.compile off, subset=50 | 1.06% | 0.91% | 2.236 | 3.179 | 0.598 | 6.535 | 50/50 | local H200 run, c=16 |
 | Higgs TTS | ZH, stream=False, CUDA Graph on, torch.compile off | TBD | TBD | TBD | TBD | TBD | TBD | TBD | local full/subset run |
 
 ## Adding a New Model or Task
