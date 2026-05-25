@@ -583,6 +583,10 @@ def _default_profile_template(profile_output_dir: str, run_id: str) -> str:
     return os.path.abspath(os.path.join(profile_output_dir, run_id, "{stage}", "trace"))
 
 
+def _default_profile_event_dir(profile_output_dir: str, run_id: str) -> str:
+    return os.path.abspath(os.path.join(profile_output_dir, run_id, "events"))
+
+
 async def _post_profile_control(
     *,
     base_url: str,
@@ -603,40 +607,56 @@ async def _post_profile_control(
                 return {"raw": text}
 
 
-async def _start_profile(args: argparse.Namespace) -> tuple[str, dict] | None:
+async def _start_profile(args: argparse.Namespace) -> tuple[str, str] | None:
     if not args.profile:
         return None
     run_id = args.profile_run_id or f"higgs_tts_{uuid.uuid4().hex[:8]}"
     base_url = build_base_url(_config_from_args(args))
     body: dict = {"run_id": run_id}
-    if args.profile_output_dir:
-        body["trace_path_template"] = _default_profile_template(
-            args.profile_output_dir, run_id
-        )
+    if args.profile_mode == "request":
+        endpoint = "start_request_profile"
+        if args.profile_output_dir:
+            body["event_dir"] = _default_profile_event_dir(
+                args.profile_output_dir, run_id
+            )
+    else:
+        endpoint = "start_profile"
+        if args.profile_output_dir:
+            body["trace_path_template"] = _default_profile_template(
+                args.profile_output_dir, run_id
+            )
+            body["event_dir"] = _default_profile_event_dir(
+                args.profile_output_dir, run_id
+            )
+        body["enable_torch"] = True
     result = await _post_profile_control(
         base_url=base_url,
-        endpoint="start_profile",
+        endpoint=endpoint,
         body=body,
     )
     logger.info("Started profiler: %s", result)
-    return run_id, body
+    return run_id, endpoint
 
 
 async def _stop_profile(
-    args: argparse.Namespace, started: tuple[str, dict] | None
+    args: argparse.Namespace, started: tuple[str, str] | None
 ) -> None:
     if started is None:
         return
-    run_id, start_body = started
+    run_id, start_endpoint = started
+    stop_endpoint = (
+        "stop_request_profile"
+        if start_endpoint == "start_request_profile"
+        else "stop_profile"
+    )
     body: dict = {"run_id": run_id}
     base_url = build_base_url(_config_from_args(args))
     result = await _post_profile_control(
         base_url=base_url,
-        endpoint="stop_profile",
+        endpoint=stop_endpoint,
         body=body,
     )
     logger.info("Stopped profiler: %s", result)
-
 
 async def _run_with_optional_profile(args: argparse.Namespace, run_coro_factory) -> dict:
     started = await _start_profile(args)
@@ -683,15 +703,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--profile",
         action="store_true",
-        help="Capture an end-to-end Torch profiler trace during generation/cache test.",
+        help="Capture profiler output during generation/cache test.",
+    )
+    parser.add_argument(
+        "--profile-mode",
+        choices=("torch", "request"),
+        default="torch",
+        help=(
+            "Profiler mode: torch captures Torch traces plus request events; "
+            "request captures lower-overhead stage events only."
+        ),
     )
     parser.add_argument(
         "--profile-output-dir",
         type=str,
         default=None,
         help=(
-            "Directory for profiler traces. The benchmark sends a "
-            "{stage}-aware trace_path_template to /start_profile."
+            "Directory for profiler output. Torch mode writes traces and "
+            "stage events; request mode writes stage events only."
         ),
     )
     parser.add_argument(
