@@ -353,6 +353,8 @@ def create_vocoder_executor(
             }
             if state.engine_time_s:
                 usage["engine_time_s"] = round(state.engine_time_s, 6)
+            usage["cached_tokens"] = state.cached_tokens
+            usage["cache_hit_rate"] = round(state.cache_hit_rate, 6)
             payload.data["usage"] = usage
         return payload
 

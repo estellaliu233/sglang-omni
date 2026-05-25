@@ -13,6 +13,8 @@ import asyncio
 import csv
 import logging
 import os
+import time
+import uuid
 from dataclasses import dataclass
 from statistics import mean
 from typing import Iterable
@@ -21,7 +23,11 @@ import aiohttp
 
 from benchmarks.benchmarker.data import RequestResult
 from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig
-from benchmarks.benchmarker.utils import save_json_results, wait_for_service
+from benchmarks.benchmarker.utils import (
+    get_wav_duration,
+    save_json_results,
+    wait_for_service,
+)
 from benchmarks.dataset.seedtts import SampleInput, load_seedtts_samples
 from benchmarks.eval.benchmark_tts_seedtts import (
     TtsSeedttsBenchmarkConfig,
@@ -29,7 +35,7 @@ from benchmarks.eval.benchmark_tts_seedtts import (
     run_tts_seedtts_transcribe,
 )
 from benchmarks.metrics.performance import print_speed_summary
-from benchmarks.tasks.tts import build_base_url, make_tts_send_fn
+from benchmarks.tasks.tts import build_base_url
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,6 +44,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DEFAULT_HIGGS_MODEL = "boson-sglang/higgs-audio-v3-tts-4b-base"
+TEXT_PREVIEW_LENGTH = 60
 
 
 @dataclass
@@ -45,6 +52,95 @@ class CacheScenarioResult:
     scenario: str
     outputs: list[RequestResult]
     cold_count: int = 0
+
+
+def _set_cache_metrics_from_headers(result: RequestResult, headers) -> None:
+    cached_tok = headers.get("X-Cached-Tokens")
+    cache_hit_rate = headers.get("X-Cache-Hit-Rate")
+    if cached_tok is not None:
+        result.cached_tokens = int(cached_tok)
+    if cache_hit_rate is not None:
+        result.cache_hit_rate = float(cache_hit_rate)
+
+
+def _set_usage_metrics_from_headers(result: RequestResult, headers) -> None:
+    prompt_tok = headers.get("X-Prompt-Tokens")
+    comp_tok = headers.get("X-Completion-Tokens")
+    eng_time = headers.get("X-Engine-Time")
+    if prompt_tok is not None:
+        result.prompt_tokens = int(prompt_tok)
+    if comp_tok is not None:
+        result.completion_tokens = int(comp_tok)
+    if eng_time is not None:
+        result.engine_time_s = float(eng_time)
+    _set_cache_metrics_from_headers(result, headers)
+    if result.completion_tokens > 0 and result.engine_time_s > 0:
+        result.tok_per_s = result.completion_tokens / result.engine_time_s
+
+
+def _build_cache_test_payload(
+    sample: SampleInput, model: str, generation_kwargs: dict
+) -> dict:
+    payload = {
+        "model": model,
+        "input": sample.target_text,
+        "response_format": "wav",
+        "ref_audio": sample.ref_audio,
+        "ref_text": sample.ref_text,
+    }
+    for key, value in generation_kwargs.items():
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+def _make_higgs_cache_send_fn(
+    model: str,
+    api_url: str,
+    *,
+    save_audio_dir: str,
+    generation_kwargs: dict,
+):
+    async def send_fn(
+        session: aiohttp.ClientSession, sample: SampleInput
+    ) -> RequestResult:
+        result = RequestResult(
+            request_id=sample.sample_id,
+            text=sample.target_text[:TEXT_PREVIEW_LENGTH],
+        )
+        payload = _build_cache_test_payload(sample, model, generation_kwargs)
+        start_time = time.perf_counter()
+        try:
+            async with session.post(api_url, json=payload) as response:
+                if response.status != 200:
+                    result.error = f"HTTP {response.status}: {await response.text()}"
+                    return result
+
+                audio_bytes = await response.read()
+                result.audio_duration_s = get_wav_duration(audio_bytes)
+                if result.audio_duration_s <= 0:
+                    result.error = (
+                        f"Empty or invalid audio response ({len(audio_bytes)} bytes)"
+                    )
+                    return result
+
+                result.is_success = True
+                result.rtf = (
+                    time.perf_counter() - start_time
+                ) / result.audio_duration_s
+                _set_usage_metrics_from_headers(result, response.headers)
+                if audio_bytes:
+                    audio_path = os.path.join(save_audio_dir, f"{result.request_id}.wav")
+                    with open(audio_path, "wb") as fh:
+                        fh.write(audio_bytes)
+                    result.wav_path = audio_path
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            result.error = str(exc)
+        finally:
+            result.latency_s = time.perf_counter() - start_time
+        return result
+
+    return send_fn
 
 
 def _build_generation_kwargs(args: argparse.Namespace) -> dict:
@@ -127,13 +223,11 @@ async def _run_samples(
             disable_tqdm=disable_tqdm,
         )
     )
-    send_fn = make_tts_send_fn(
+    send_fn = _make_higgs_cache_send_fn(
         model,
         api_url,
-        stream=False,
-        no_ref_audio=False,
         save_audio_dir=save_audio_dir,
-        **generation_kwargs,
+        generation_kwargs=generation_kwargs,
     )
     return await runner.run(samples, send_fn)
 
@@ -149,13 +243,11 @@ async def _run_one_sample(
 ) -> RequestResult:
     save_audio_dir = os.path.abspath(os.path.join(output_dir, save_audio_subdir))
     os.makedirs(save_audio_dir, exist_ok=True)
-    send_fn = make_tts_send_fn(
+    send_fn = _make_higgs_cache_send_fn(
         model,
         api_url,
-        stream=False,
-        no_ref_audio=False,
         save_audio_dir=save_audio_dir,
-        **generation_kwargs,
+        generation_kwargs=generation_kwargs,
     )
     timeout = aiohttp.ClientTimeout(total=300)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -177,6 +269,28 @@ def _mean_or_zero(values: list[float]) -> float:
     return round(mean(values), 6) if values else 0.0
 
 
+def _successful_count(outputs: Iterable[RequestResult]) -> int:
+    return sum(1 for output in outputs if output.is_success)
+
+
+def _successful_metric_including_zero(
+    outputs: Iterable[RequestResult], attr: str
+) -> list[float]:
+    return [
+        float(getattr(output, attr, 0.0) or 0.0)
+        for output in outputs
+        if output.is_success
+    ]
+
+
+def _cache_hit_count(outputs: Iterable[RequestResult]) -> int:
+    return sum(
+        1
+        for output in outputs
+        if output.is_success and int(getattr(output, "cached_tokens", 0) or 0) > 0
+    )
+
+
 def _summary(
     *,
     miss_outputs: list[RequestResult],
@@ -189,11 +303,26 @@ def _summary(
     hit_latency = _successful_metric(hit_measured, "latency_s")
     miss_engine = _successful_metric(miss_outputs, "engine_time_s")
     hit_engine = _successful_metric(hit_measured, "engine_time_s")
+    miss_cached_tokens = _successful_metric_including_zero(
+        miss_outputs, "cached_tokens"
+    )
+    hit_cached_tokens = _successful_metric_including_zero(
+        hit_measured, "cached_tokens"
+    )
+    miss_cache_hit_rate = _successful_metric_including_zero(
+        miss_outputs, "cache_hit_rate"
+    )
+    hit_cache_hit_rate = _successful_metric_including_zero(
+        hit_measured, "cache_hit_rate"
+    )
 
     miss_latency_mean = _mean_or_zero(miss_latency)
     hit_latency_mean = _mean_or_zero(hit_latency)
     miss_engine_mean = _mean_or_zero(miss_engine)
     hit_engine_mean = _mean_or_zero(hit_engine)
+    hit_expected_cache_hits = _successful_count(hit_measured)
+    miss_cache_hits = _cache_hit_count(miss_outputs)
+    hit_cache_hits = _cache_hit_count(hit_measured)
 
     return {
         "concurrency": concurrency,
@@ -202,6 +331,28 @@ def _summary(
         "hit_cold_excluded": hit_cold_count,
         "miss_failed": sum(not o.is_success for o in miss_outputs),
         "hit_failed": sum(not o.is_success for o in hit_measured),
+        "miss_expected_cache_hits": 0,
+        "hit_expected_cache_hits": hit_expected_cache_hits,
+        "miss_expected_request_cache_hit_rate": 0.0,
+        "hit_expected_request_cache_hit_rate": round(
+            hit_expected_cache_hits / len(hit_measured), 6
+        )
+        if hit_measured
+        else 0.0,
+        "miss_cache_hits": miss_cache_hits,
+        "hit_cache_hits": hit_cache_hits,
+        "miss_request_cache_hit_rate": round(
+            miss_cache_hits / len(miss_outputs), 6
+        )
+        if miss_outputs
+        else 0.0,
+        "hit_request_cache_hit_rate": round(hit_cache_hits / len(hit_measured), 6)
+        if hit_measured
+        else 0.0,
+        "miss_cached_tokens_mean": _mean_or_zero(miss_cached_tokens),
+        "hit_cached_tokens_mean": _mean_or_zero(hit_cached_tokens),
+        "miss_token_cache_hit_rate_mean": _mean_or_zero(miss_cache_hit_rate),
+        "hit_token_cache_hit_rate_mean": _mean_or_zero(hit_cache_hit_rate),
         "miss_latency_mean_s": miss_latency_mean,
         "hit_latency_mean_s": hit_latency_mean,
         "latency_saved_s": round(miss_latency_mean - hit_latency_mean, 6)
@@ -227,6 +378,7 @@ def _row(scenario: str, index: int, output: RequestResult, *, is_cold: bool) -> 
         "request_index": index,
         "id": output.request_id,
         "is_cold": is_cold,
+        "expected_cache_hit": scenario == "same_ref_hit" and not is_cold,
         "is_success": output.is_success,
         "latency_s": round(output.latency_s, 6),
         "engine_time_s": round(output.engine_time_s, 6)
@@ -236,6 +388,8 @@ def _row(scenario: str, index: int, output: RequestResult, *, is_cold: bool) -> 
         "rtf": round(output.rtf, 6) if output.rtf < float("inf") else None,
         "prompt_tokens": output.prompt_tokens or None,
         "completion_tokens": output.completion_tokens or None,
+        "cached_tokens": getattr(output, "cached_tokens", 0),
+        "cache_hit_rate": round(float(getattr(output, "cache_hit_rate", 0.0)), 6),
         "tok_per_s": round(output.tok_per_s, 6) if output.tok_per_s > 0 else None,
         "wav_path": output.wav_path or None,
         "error": output.error or None,
@@ -384,6 +538,24 @@ def print_cache_summary(summary: dict) -> None:
     print(f"  Miss samples:                {summary['miss_samples']}")
     print(f"  Hit samples:                 {summary['hit_samples']}")
     print(f"  Hit cold excluded:           {summary['hit_cold_excluded']}")
+    print(f"  Miss expected cache hits:    {summary['miss_expected_cache_hits']}")
+    print(f"  Hit expected cache hits:     {summary['hit_expected_cache_hits']}")
+    print(
+        "  Miss expected hit rate:      "
+        f"{summary['miss_expected_request_cache_hit_rate']}"
+    )
+    print(
+        "  Hit expected hit rate:       "
+        f"{summary['hit_expected_request_cache_hit_rate']}"
+    )
+    print(f"  Miss actual cache hits:      {summary['miss_cache_hits']}")
+    print(f"  Hit actual cache hits:       {summary['hit_cache_hits']}")
+    print(f"  Miss actual hit rate:        {summary['miss_request_cache_hit_rate']}")
+    print(f"  Hit actual hit rate:         {summary['hit_request_cache_hit_rate']}")
+    print(f"  Miss cached tokens mean:     {summary['miss_cached_tokens_mean']}")
+    print(f"  Hit cached tokens mean:      {summary['hit_cached_tokens_mean']}")
+    print(f"  Miss token hit rate mean:    {summary['miss_token_cache_hit_rate_mean']}")
+    print(f"  Hit token hit rate mean:     {summary['hit_token_cache_hit_rate_mean']}")
     print(f"  Miss latency mean (s):       {summary['miss_latency_mean_s']}")
     print(f"  Hit latency mean (s):        {summary['hit_latency_mean_s']}")
     print(f"  Latency saved (s):           {summary['latency_saved_s']}")
@@ -405,6 +577,73 @@ async def run_generate(args: argparse.Namespace) -> dict:
         title="Higgs TTS Speed Benchmark Result",
     )
     return results
+
+
+def _default_profile_template(profile_output_dir: str, run_id: str) -> str:
+    return os.path.abspath(os.path.join(profile_output_dir, run_id, "{stage}", "trace"))
+
+
+async def _post_profile_control(
+    *,
+    base_url: str,
+    endpoint: str,
+    body: dict,
+) -> dict:
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(f"{base_url}/{endpoint}", json=body) as response:
+            text = await response.text()
+            if response.status != 200:
+                raise RuntimeError(
+                    f"{endpoint} failed with HTTP {response.status}: {text}"
+                )
+            try:
+                return await response.json()
+            except aiohttp.ContentTypeError:
+                return {"raw": text}
+
+
+async def _start_profile(args: argparse.Namespace) -> tuple[str, dict] | None:
+    if not args.profile:
+        return None
+    run_id = args.profile_run_id or f"higgs_tts_{uuid.uuid4().hex[:8]}"
+    base_url = build_base_url(_config_from_args(args))
+    body: dict = {"run_id": run_id}
+    if args.profile_output_dir:
+        body["trace_path_template"] = _default_profile_template(
+            args.profile_output_dir, run_id
+        )
+    result = await _post_profile_control(
+        base_url=base_url,
+        endpoint="start_profile",
+        body=body,
+    )
+    logger.info("Started profiler: %s", result)
+    return run_id, body
+
+
+async def _stop_profile(
+    args: argparse.Namespace, started: tuple[str, dict] | None
+) -> None:
+    if started is None:
+        return
+    run_id, start_body = started
+    body: dict = {"run_id": run_id}
+    base_url = build_base_url(_config_from_args(args))
+    result = await _post_profile_control(
+        base_url=base_url,
+        endpoint="stop_profile",
+        body=body,
+    )
+    logger.info("Stopped profiler: %s", result)
+
+
+async def _run_with_optional_profile(args: argparse.Namespace, run_coro_factory) -> dict:
+    started = await _start_profile(args)
+    try:
+        return await run_coro_factory()
+    finally:
+        await _stop_profile(args, started)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -441,7 +680,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lang", type=str, choices=["en", "zh"], default="en")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--server-timeout", type=int, default=1200)
-
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Capture an end-to-end Torch profiler trace during generation/cache test.",
+    )
+    parser.add_argument(
+        "--profile-output-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory for profiler traces. The benchmark sends a "
+            "{stage}-aware trace_path_template to /start_profile."
+        ),
+    )
+    parser.add_argument(
+        "--profile-run-id",
+        type=str,
+        default=None,
+        help="Optional profiler run id. Defaults to a higgs_tts_<uuid> value.",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--generate-only", action="store_true")
     mode.add_argument("--transcribe-only", action="store_true")
@@ -485,10 +743,10 @@ def main() -> None:
     )
 
     if args.cache_test:
-        asyncio.run(run_cache_test(args))
+        asyncio.run(_run_with_optional_profile(args, lambda: run_cache_test(args)))
         return
 
-    asyncio.run(run_generate(args))
+    asyncio.run(_run_with_optional_profile(args, lambda: run_generate(args)))
 
 
 if __name__ == "__main__":

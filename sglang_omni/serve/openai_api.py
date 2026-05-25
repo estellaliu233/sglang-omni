@@ -530,6 +530,10 @@ def _register_speech(app: FastAPI) -> None:
                 headers["X-Completion-Tokens"] = str(result.usage.completion_tokens)
             if result.usage.engine_time_s is not None:
                 headers["X-Engine-Time"] = str(result.usage.engine_time_s)
+            if result.usage.cached_tokens is not None:
+                headers["X-Cached-Tokens"] = str(result.usage.cached_tokens)
+            if result.usage.cache_hit_rate is not None:
+                headers["X-Cache-Hit-Rate"] = str(result.usage.cache_hit_rate)
 
         return Response(
             content=result.audio_bytes,
