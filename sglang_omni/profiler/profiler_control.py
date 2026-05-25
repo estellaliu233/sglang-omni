@@ -42,7 +42,6 @@ class ProfilerControlClient:
         self,
         run_id: str,
         trace_path_template: str,
-        config: dict[str, Any] | None = None,
         stages: list[str] | None = None,
     ) -> None:
         await self.start()
@@ -51,7 +50,6 @@ class ProfilerControlClient:
         msg = ProfilerStartMessage(
             run_id=run_id,
             trace_path_template=trace_path_template,
-            config=config,
         )
         for s in targets:
             sock = self._socks.get(s)

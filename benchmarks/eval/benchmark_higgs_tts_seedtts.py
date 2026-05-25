@@ -489,18 +489,7 @@ async def _start_profile(args: argparse.Namespace) -> tuple[str, dict] | None:
         return None
     run_id = args.profile_run_id or f"higgs_tts_{uuid.uuid4().hex[:8]}"
     base_url = build_base_url(_config_from_args(args))
-    body: dict = {
-        "run_id": run_id,
-        "config": {
-            "benchmark": "higgs_tts_seedtts",
-            "mode": "cache_test" if args.cache_test else "generate",
-            "meta": args.meta,
-            "max_samples": args.max_samples,
-            "cache_test_samples": args.cache_test_samples,
-            "concurrency": args.max_concurrency,
-            "request_rate": args.request_rate,
-        },
-    }
+    body: dict = {"run_id": run_id}
     if args.profile_output_dir:
         body["trace_path_template"] = _default_profile_template(
             args.profile_output_dir, run_id
