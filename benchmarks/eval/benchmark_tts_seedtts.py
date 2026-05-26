@@ -7,9 +7,7 @@ Note (Qiujiang, Chenyang):
   ref_text from the meta file.
 2. Plain TTS (e.g. mistralai/Voxtral-4B-TTS-2603): use --no-ref-audio and
   --voice for a server-side speaker preset.
-3. Higgs TTS uses the same benchmark. The payload builder auto-sends
-  references=[{audio_path, text}] for Higgs models; use --ref-format to
-  override if needed.
+3. Higgs TTS uses the same benchmark with --ref-format references.
 
 Usage:
 
@@ -50,6 +48,7 @@ Usage:
     python -m benchmarks.eval.benchmark_tts_seedtts \
         --meta zhaochenyang20/seed-tts-eval-arrow \
         --model boson-sglang/higgs-audio-v3-tts-4b-base --port 8000 \
+        --ref-format references \
         --output-dir results/higgs_tts_en \
         --lang en --max-concurrency 16
 
@@ -189,9 +188,9 @@ class TtsSeedttsBenchmarkConfig:
     # seed-tts-eval reference audio.  The ``--no-ref-audio`` CLI flag flips
     # this to False for plain TTS models that do not accept ref audio.
     voice_clone: bool = True
-    # Reference payload shape for voice cloning. "auto" preserves the flat
-    # ref_audio/ref_text fields for most models and uses references[] for Higgs.
-    ref_format: str = "auto"
+    # Reference payload shape for voice cloning. The default keeps the original
+    # ref_audio/ref_text fields; Higgs TTS should pass --ref-format references.
+    ref_format: str = "flat"
     output_dir: str = "results/tts_seedtts"
     max_samples: int | None = None
     max_new_tokens: int | None = 2048
@@ -225,14 +224,6 @@ def _build_generation_kwargs(config: TtsSeedttsBenchmarkConfig) -> dict:
     return generation_kwargs
 
 
-def _resolve_ref_format(config: TtsSeedttsBenchmarkConfig) -> str:
-    if config.ref_format != "auto":
-        return config.ref_format
-    if "higgs" in config.model.lower():
-        return "references"
-    return "flat"
-
-
 def _build_results_config(
     config: TtsSeedttsBenchmarkConfig,
     *,
@@ -243,7 +234,7 @@ def _build_results_config(
         "base_url": base_url,
         "meta": config.meta,
         "voice_clone": config.voice_clone,
-        "ref_format": _resolve_ref_format(config),
+        "ref_format": config.ref_format,
         "voice": config.voice,
         "stream": config.stream,
         "max_samples": config.max_samples,
@@ -276,7 +267,7 @@ async def run_tts_seedtts_benchmark(
         api_url,
         stream=config.stream,
         no_ref_audio=not config.voice_clone,
-        ref_format=_resolve_ref_format(config),
+        ref_format=config.ref_format,
         voice=config.voice,
         save_audio_dir=save_audio_dir,
         **generation_kwargs,
@@ -312,7 +303,7 @@ def run_tts_seedtts_transcribe(config: TtsSeedttsBenchmarkConfig) -> dict:
         "model": config.model,
         "meta": config.meta,
         "voice_clone": config.voice_clone,
-        "ref_format": _resolve_ref_format(config),
+        "ref_format": config.ref_format,
         "voice": config.voice,
         "max_new_tokens": config.max_new_tokens,
         "temperature": config.temperature,
@@ -410,13 +401,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ref-format",
-        choices=["auto", "flat", "references"],
-        default="auto",
+        choices=["flat", "references"],
+        default="flat",
         help=(
-            "Reference payload shape for voice cloning. 'flat' sends "
-            "ref_audio/ref_text, 'references' sends references=[{audio_path, "
-            "text}], and 'auto' uses references for Higgs models and flat "
-            "fields otherwise."
+            "Reference payload shape for voice cloning. The default 'flat' sends "
+            "ref_audio/ref_text, preserving the original behavior for S2-Pro "
+            "and similar models. Use 'references' for Higgs TTS."
         ),
     )
     parser.add_argument("--output-dir", type=str, default="results/tts_seedtts")

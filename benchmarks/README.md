@@ -79,6 +79,7 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
 python -m benchmarks.eval.benchmark_tts_seedtts \
     --meta zhaochenyang20/seed-tts-eval-arrow \
     --model boson-sglang/higgs-audio-v3-tts-4b-base --port 8000 \
+    --ref-format references \
     --max-concurrency 16 \
     --output-dir results/higgs_tts_en --lang en --max-samples 50
 
@@ -151,9 +152,8 @@ to avoid GPU contention with the server. Use `--generate-only` or
 `--transcribe-only` to run a single phase. For TTS, `--concurrency` and
 `--max-concurrency` are equivalent (see `benchmark_tts_seedtts.py`).
 `benchmark_tts_seedtts.py` also handles model-specific voice-cloning reference
-payloads: `--ref-format flat` sends `ref_audio`/`ref_text`,
-`--ref-format references` sends `references=[{audio_path, text}]`, and the
-default `--ref-format auto` selects `references` for Higgs models.
+payloads: the default `--ref-format flat` sends `ref_audio`/`ref_text`, while
+`--ref-format references` sends `references=[{audio_path, text}]` for Higgs TTS.
 `benchmark_omni_seedtts.py` documents local vs CI GPU usage in its module
 docstring (sequential phases on CI to reduce OOM risk).
 
