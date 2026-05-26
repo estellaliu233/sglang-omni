@@ -157,15 +157,6 @@ payloads: the default `--ref-format flat` sends `ref_audio`/`ref_text`, while
 `benchmark_omni_seedtts.py` documents local vs CI GPU usage in its module
 docstring (sequential phases on CI to reduce OOM risk).
 
-
-## SeedTTS Full-Set Reference Results
-
-Full-set SeedTTS reference results live in
-`eval/benchmark_tts_seedtts.py` alongside the benchmark entry point. That table
-includes Higgs TTS local H200 results and the existing S2-Pro H200/H100
-references. Higgs rows use `examples/configs/higgs_tts.yaml`, which keeps CUDA
-Graph enabled and does not enable `torch.compile`.
-
 ## Adding a New Model or Task
 
 - **New model, same task/API type** (e.g. another OAI-compatible TTS model):

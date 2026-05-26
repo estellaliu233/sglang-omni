@@ -38,8 +38,6 @@ class HiggsTtsState:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     engine_time_s: float = 0.0
-    cached_tokens: int = 0
-    cache_hit_rate: float = 0.0
 
     # vocoder
     audio_samples: Any | None = None
@@ -67,13 +65,7 @@ class HiggsTtsState:
                 data[key] = value
         if self.output_codes_delayed is not None:
             data["output_codes_delayed"] = self.output_codes_delayed
-        for key in (
-            "prompt_tokens",
-            "completion_tokens",
-            "engine_time_s",
-            "cached_tokens",
-            "cache_hit_rate",
-        ):
+        for key in ("prompt_tokens", "completion_tokens", "engine_time_s"):
             value = getattr(self, key)
             if value:
                 data[key] = value
@@ -101,8 +93,6 @@ class HiggsTtsState:
             prompt_tokens=data.get("prompt_tokens", 0),
             completion_tokens=data.get("completion_tokens", 0),
             engine_time_s=data.get("engine_time_s", 0.0),
-            cached_tokens=data.get("cached_tokens", 0),
-            cache_hit_rate=data.get("cache_hit_rate", 0.0),
             audio_samples=data.get("audio_samples"),
             sample_rate=data.get("sample_rate", 24000),
         )

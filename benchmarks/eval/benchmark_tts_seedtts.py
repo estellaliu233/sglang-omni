@@ -109,8 +109,6 @@ Generation speed (generation.speed)
 
 | Model  | Config           | latency_mean_s | latency_p95_s | rtf_mean | throughput_qps | output_tok_per_req_s | Source                         |
 | ------ | ---------------- | -------------- | ------------- | -------- | -------------- | ------------------------------ | ------------------------------ |
-| Higgs TTS | EN, stream=False | 1.749 | 2.600 | 0.425 | 9.104 | 112.9 | local H200 [full-set, c=16, CUDA Graph on, torch.compile off] |
-| Higgs TTS | ZH, stream=False | 1.629 | 2.110 | 0.282 | 9.792 | 109.9 | local H200 [full-set, c=16, CUDA Graph on, torch.compile off] |
 | S2-Pro | EN, stream=False | 15.836         | 21.509        | 4.269    | 1.005          | 75.0                           | PR #411 [H200, full-set, c=16] |
 | S2-Pro | EN, stream=True  | 16.135         | 21.733        | 4.357    | 0.985          | 74.1                           | PR #411 [H200, full-set, c=16] |
 | S2-Pro | ZH, stream=False | 16.114         | 20.092        | 3.018    | 0.990          | 73.1                           | PR #411 [H200, full-set, c=16] |
@@ -123,6 +121,8 @@ Generation speed (generation.speed)
 | S2-Pro | EN, stream=True  | 12.164         | 16.717        | 3.265    | 1.308          | 67.0                           | PR #411 [H100, V1-pipeline, full-set, c=16] |
 | S2-Pro | ZH, stream=False | 12.028         | 15.526        | 2.256    | 1.327          | 65.7                           | PR #411 [H100, V1-pipeline, full-set, c=16] |
 | S2-Pro | ZH, stream=True  | 11.417         | 15.020        | 2.141    | 1.398          | 65.5                           | PR #411 [H100, V1-pipeline, full-set, c=16] |
+| Higgs TTS | EN, stream=False | 1.749       | 2.600         | 0.425    | 9.104          | 112.9                          | PR #534 [H200, full-set, c=16, CUDA Graph on, torch.compile off] |
+| Higgs TTS | ZH, stream=False | 1.629       | 2.110         | 0.282    | 9.792          | 109.9                          | PR #534 [H200, full-set, c=16, CUDA Graph on, torch.compile off] |
 
 Note (Chenyang): output-token rates here count S2-Pro's codec tokens. They are not
 comparable to Qwen3-Omni rates in benchmark_omni_seedtts.py, whose tokens are
@@ -134,10 +134,10 @@ ASR speed (accuracy.asr_speed) — Whisper-large-v3 for EN, FunASR paraformer-zh
 
 | Lang | asr_latency_mean_s | asr_rtf_mean | asr_throughput_samples_per_s | Source                                          |
 | ---- | ------------------ | ------------ | ---------------------------- | ----------------------------------------------- |
-| EN   | 0.360              | 0.0835       | 2.78                         | local H200 [Higgs TTS EN stream=False full-set] |
-| ZH   | 0.0867             | 0.0157       | 11.53                        | local H200 [Higgs TTS ZH stream=False full-set] |
 | EN   | 0.297              | 0.0772       | 3.36                         | PR #393 [H200, from S2-Pro EN stream=False run] |
 | ZH   | 0.294              | 0.0556       | 3.40                         | PR #393 [H200, from S2-Pro ZH stream=False run] |
+| EN   | 0.360              | 0.0835       | 2.78                         | PR #534 [H200, from Higgs TTS EN stream=False run] |
+| ZH   | 0.0867             | 0.0157       | 11.53                        | PR #534 [H200, from Higgs TTS ZH stream=False run] |
 """
 
 from __future__ import annotations
