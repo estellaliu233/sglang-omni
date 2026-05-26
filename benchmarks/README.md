@@ -158,18 +158,19 @@ default `--ref-format auto` selects `references` for Higgs models.
 docstring (sequential phases on CI to reduce OOM risk).
 
 
-## Higgs TTS SeedTTS Results
+## SeedTTS Full-Set Reference Results
 
-Use the general `eval/benchmark_tts_seedtts.py` entry point for Higgs TTS. The
-reference Higgs server config is `examples/configs/higgs_tts.yaml`, which keeps
-CUDA Graph enabled and does not enable `torch.compile`; use
-`examples/configs/higgs_tts_cg_off.yaml` only when explicitly measuring the
-CUDA Graph off ablation.
+Use the general `eval/benchmark_tts_seedtts.py` entry point for OpenAI-compatible
+TTS models such as S2-Pro, Voxtral, and Higgs TTS. Higgs uses
+`examples/configs/higgs_tts.yaml`, which keeps CUDA Graph enabled and does not
+enable `torch.compile`; use `examples/configs/higgs_tts_cg_off.yaml` only when
+explicitly measuring the CUDA Graph off ablation.
 
-Do not mix numbers from CUDA-Graph-off or torch.compile-enabled runs. The
-Higgs rows below are full-set local H200 results with CUDA Graph on and
-`torch.compile` off. S2-Pro rows are copied from the H200 full-set reference
-results in `eval/benchmark_tts_seedtts.py` for comparison.
+The rows below are full-set SeedTTS results. Higgs rows are local 1x H200 runs
+with CUDA Graph on and `torch.compile` off. S2-Pro rows are copied from the
+H200 full-set reference results in `eval/benchmark_tts_seedtts.py`. The hardware,
+dataset size, and concurrency are aligned (1x H200, full set, c=16), but the
+model implementations and server configs differ.
 
 | Model | Config | wer_corpus | wer_corpus_excl_>50 | wer_per_sample_mean | latency_mean_s | latency_p95_s | rtf_mean | throughput_qps | evaluated | Source |
 |-------|--------|------------|---------------------|---------------------|----------------|---------------|----------|----------------|-----------|--------|
