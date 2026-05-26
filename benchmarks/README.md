@@ -79,6 +79,7 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
 python -m benchmarks.eval.benchmark_tts_seedtts \
     --meta zhaochenyang20/seed-tts-eval-arrow \
     --model boson-sglang/higgs-audio-v3-tts-4b-base --port 8000 \
+    --ref-format references \
     --max-concurrency 16 \
     --output-dir results/higgs_tts_en --lang en --max-samples 50
 
@@ -151,29 +152,10 @@ to avoid GPU contention with the server. Use `--generate-only` or
 `--transcribe-only` to run a single phase. For TTS, `--concurrency` and
 `--max-concurrency` are equivalent (see `benchmark_tts_seedtts.py`).
 `benchmark_tts_seedtts.py` also handles model-specific voice-cloning reference
-payloads: `--ref-format flat` sends `ref_audio`/`ref_text`,
-`--ref-format references` sends `references=[{audio_path, text}]`, and the
-default `--ref-format auto` selects `references` for Higgs models.
+payloads: the default `--ref-format flat` sends `ref_audio`/`ref_text`, while
+`--ref-format references` sends `references=[{audio_path, text}]` for Higgs TTS.
 `benchmark_omni_seedtts.py` documents local vs CI GPU usage in its module
 docstring (sequential phases on CI to reduce OOM risk).
-
-
-## Higgs TTS SeedTTS Results
-
-Use the general `eval/benchmark_tts_seedtts.py` entry point for Higgs TTS. The
-reference Higgs server config is `examples/configs/higgs_tts.yaml`, which keeps
-CUDA Graph enabled and does not enable `torch.compile`; use
-`examples/configs/higgs_tts_cg_off.yaml` only when explicitly measuring the
-CUDA Graph off ablation.
-
-Do not mix numbers from CUDA-Graph-off or torch.compile-enabled runs. Mark
-subset runs explicitly; full-set numbers should replace subset rows when
-available.
-
-| Model | Config | wer_corpus | wer_per_sample_mean | latency_mean_s | latency_p95_s | rtf_mean | throughput_qps | evaluated | Source |
-|-------|--------|------------|---------------------|----------------|---------------|----------|----------------|-----------|--------|
-| Higgs TTS | EN, stream=False, CUDA Graph on, torch.compile off, subset=50 | 1.06% | 0.91% | 2.236 | 3.179 | 0.598 | 6.535 | 50/50 | local H200 run, c=16 |
-| Higgs TTS | ZH, stream=False, CUDA Graph on, torch.compile off, subset=50 | 0.43% | 0.37% | 2.090 | 3.386 | 0.388 | 7.120 | 50/50 | local H200 run, c=16 |
 
 ## Adding a New Model or Task
 

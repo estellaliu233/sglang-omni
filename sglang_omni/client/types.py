@@ -27,8 +27,6 @@ class UsageInfo:
     completion_tokens: int | None = None
     total_tokens: int | None = None
     engine_time_s: float | None = None
-    cached_tokens: int | None = None
-    cache_hit_rate: float | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "UsageInfo | None":
@@ -39,8 +37,6 @@ class UsageInfo:
             completion_tokens=data.get("completion_tokens"),
             total_tokens=data.get("total_tokens"),
             engine_time_s=data.get("engine_time_s"),
-            cached_tokens=data.get("cached_tokens"),
-            cache_hit_rate=data.get("cache_hit_rate"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -51,10 +47,6 @@ class UsageInfo:
         }
         if self.engine_time_s is not None:
             d["engine_time_s"] = self.engine_time_s
-        if self.cached_tokens is not None:
-            d["cached_tokens"] = self.cached_tokens
-        if self.cache_hit_rate is not None:
-            d["cache_hit_rate"] = self.cache_hit_rate
         return d
 
 
