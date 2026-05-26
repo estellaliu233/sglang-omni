@@ -81,12 +81,17 @@ CI runs on a subset and has its own thresholds elsewhere (see tasks/*.py).
 
 Benchmark: SeedTTS  |  Dataset: seed-tts-eval, full set (EN=1088, ZH=2020)
 Hardware:  1 x H200 (default; non-H200 sources are tagged in Source column)
-Last verified: 2026-05-04
+Last verified: 2026-05-25
 
 Accuracy (accuracy.wer)
 
+Note: the Higgs TTS EN raw corpus WER includes 2 samples above 50% WER; the
+outlier-excluded corpus WER is 1.36%.
+
 | Model  | Config           | wer_corpus | wer_per_sample_mean | wer_per_sample_median | wer_per_sample_std | evaluated | skipped | Source                         |
 | ------ | ---------------- | ---------- | ------------------- | --------------------- | ------------------ | --------- | ------- | ------------------------------ |
+| Higgs TTS | EN, stream=False | 4.68% (1.36% excl >50%) | 4.16% | 0.00% | 91.2% | 1088/1088 | 0 | local H200 [full-set, c=16, CUDA Graph on, torch.compile off] |
+| Higgs TTS | ZH, stream=False | 1.14% | 1.08% | 0.00% | 2.7% | 2020/2020 | 0 | local H200 [full-set, c=16, CUDA Graph on, torch.compile off] |
 | S2-Pro | EN, stream=False | 1.07%      | 1.03%               | 0.00%                 | 3.6%               | 1088/1088 | 0       | PR #411 [H200, full-set, c=16] |
 | S2-Pro | EN, stream=True  | 1.05%      | 1.00%               | 0.00%                 | 3.5%               | 1088/1088 | 0       | PR #411 [H200, full-set, c=16] |
 | S2-Pro | ZH, stream=False | 1.02%      | 0.98%               | 0.00%                 | 3.3%               | 2020/2020 | 0       | PR #411 [H200, full-set, c=16] |
@@ -105,6 +110,8 @@ Generation speed (generation.speed)
 
 | Model  | Config           | latency_mean_s | latency_p95_s | rtf_mean | throughput_qps | output_tok_per_req_s | Source                         |
 | ------ | ---------------- | -------------- | ------------- | -------- | -------------- | ------------------------------ | ------------------------------ |
+| Higgs TTS | EN, stream=False | 1.749 | 2.600 | 0.425 | 9.104 | 112.9 | local H200 [full-set, c=16, CUDA Graph on, torch.compile off] |
+| Higgs TTS | ZH, stream=False | 1.629 | 2.110 | 0.282 | 9.792 | 109.9 | local H200 [full-set, c=16, CUDA Graph on, torch.compile off] |
 | S2-Pro | EN, stream=False | 15.836         | 21.509        | 4.269    | 1.005          | 75.0                           | PR #411 [H200, full-set, c=16] |
 | S2-Pro | EN, stream=True  | 16.135         | 21.733        | 4.357    | 0.985          | 74.1                           | PR #411 [H200, full-set, c=16] |
 | S2-Pro | ZH, stream=False | 16.114         | 20.092        | 3.018    | 0.990          | 73.1                           | PR #411 [H200, full-set, c=16] |
@@ -128,6 +135,8 @@ ASR speed (accuracy.asr_speed) — Whisper-large-v3 for EN, FunASR paraformer-zh
 
 | Lang | asr_latency_mean_s | asr_rtf_mean | asr_throughput_samples_per_s | Source                                          |
 | ---- | ------------------ | ------------ | ---------------------------- | ----------------------------------------------- |
+| EN   | 0.360              | 0.0835       | 2.78                         | local H200 [Higgs TTS EN stream=False full-set] |
+| ZH   | 0.0867             | 0.0157       | 11.53                        | local H200 [Higgs TTS ZH stream=False full-set] |
 | EN   | 0.297              | 0.0772       | 3.36                         | PR #393 [H200, from S2-Pro EN stream=False run] |
 | ZH   | 0.294              | 0.0556       | 3.40                         | PR #393 [H200, from S2-Pro ZH stream=False run] |
 """
