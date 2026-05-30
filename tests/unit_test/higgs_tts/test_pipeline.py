@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import base64
 import queue
 from types import SimpleNamespace
 
@@ -100,6 +101,210 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     assert (
         captured["stream_outbox"]
         is captured["scheduler_kwargs"]["model_runner"]._outbox
+    )
+
+
+def test_higgs_reference_cache_key_round_trip() -> None:
+    state = HiggsTtsState(reference_cache_key="path:/tmp/ref.wav")
+
+    restored = HiggsTtsState.from_dict(state.to_dict())
+
+    assert restored.reference_cache_key == "path:/tmp/ref.wav"
+
+
+def test_higgs_reference_cache_key_tracks_file_content(tmp_path) -> None:
+    ref_audio = tmp_path / "ref.wav"
+    ref_audio.write_bytes(b"a")
+    first_key = stages._reference_audio_cache_key(ref_audio)
+
+    # Same content -> stable key (so repeat requests hit the cache).
+    assert first_key == stages._reference_audio_cache_key(ref_audio)
+
+    ref_audio.write_bytes(b"longer")
+    second_key = stages._reference_audio_cache_key(ref_audio)
+
+    # Different content -> different key (so a replaced file is not stale-served).
+    assert first_key is not None and first_key.startswith("file:")
+    assert second_key is not None and second_key.startswith("file:")
+    assert first_key != second_key
+
+
+def test_higgs_reference_cache_key_same_size_edit_and_urls(tmp_path) -> None:
+    # Same path, same size, same head/tail, different middle must not stale-hit.
+    head, tail = b"H" * 8192, b"T" * 8192
+    ref_audio = tmp_path / "ref.wav"
+    ref_audio.write_bytes(head + b"a" * 4096 + tail)
+    key_a = stages._reference_audio_cache_key(ref_audio)
+    ref_audio.write_bytes(head + b"b" * 4096 + tail)  # same size, middle differs
+    assert key_a is not None and key_a != stages._reference_audio_cache_key(ref_audio)
+
+    # URLs and missing files are not cached.
+    assert stages._reference_audio_cache_key("https://example.com/ref.wav") is None
+    assert stages._reference_audio_cache_key(str(tmp_path / "missing.wav")) is None
+
+
+def test_higgs_reference_cache_key_memoizes_stable_file_hash(
+    monkeypatch, tmp_path
+) -> None:
+    ref_audio = tmp_path / "ref.wav"
+    ref_audio.write_bytes(b"fake wav bytes")
+    stages._REF_PATH_HASH_MEMO.clear()
+    read_calls = 0
+    original_read_bytes = stages.Path.read_bytes
+
+    def counting_read_bytes(path):
+        nonlocal read_calls
+        if path == ref_audio:
+            read_calls += 1
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(stages.Path, "read_bytes", counting_read_bytes)
+
+    first_key = stages._reference_audio_cache_key(ref_audio)
+    second_key = stages._reference_audio_cache_key(ref_audio)
+
+    assert first_key == second_key
+    assert read_calls == 1
+
+
+def test_higgs_reference_cache_key_ignores_media_type() -> None:
+    raw = b"\x01\x02\x03fake-audio-bytes"
+    encoded = base64.b64encode(raw).decode()
+    key_wav = stages._reference_audio_cache_key(
+        {"base64": encoded, "media_type": "audio/wav"}
+    )
+    key_mp3 = stages._reference_audio_cache_key(
+        {"base64": encoded, "media_type": "audio/mpeg"}
+    )
+
+    # media_type is a decode hint the codec ignores, so it must not split keys.
+    assert key_wav is not None
+    assert key_wav == key_mp3
+    # Raw bytes and equivalent base64 resolve to the same content key.
+    assert stages._reference_audio_cache_key({"bytes": raw}) == key_wav
+
+
+def test_higgs_audio_encoder_uses_reference_code_cache(monkeypatch) -> None:
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(
+        stages.Tokenizer,
+        "from_file",
+        lambda _path: object(),
+    )
+    monkeypatch.setattr(
+        stages,
+        "PreTrainedTokenizerFast",
+        lambda tokenizer_object: object(),
+    )
+
+    class FakeAdapter:
+        def __init__(self, _tokenizer) -> None:
+            pass
+
+        def build_prompt(
+            self, text: str, *, num_ref_tokens: int, reference_text: str | None
+        ) -> list[int]:
+            return [len(text), num_ref_tokens, len(reference_text or "")]
+
+    class FakeCodec:
+        SAMPLE_RATE = 24000
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.model = SimpleNamespace(acoustic_encoder=torch.nn.Identity())
+
+        def encode_reference(self, waveform, sample_rate: int) -> torch.Tensor:
+            self.calls += 1
+            return torch.tensor([[11, 12], [21, 22]], dtype=torch.long)
+
+    fake_codec = FakeCodec()
+    monkeypatch.setattr(stages, "HiggsTokenizerAdapter", FakeAdapter)
+    monkeypatch.setattr(stages, "get_or_load_codec", lambda *args, **kwargs: fake_codec)
+
+    scheduler = stages.create_audio_encoder_executor(
+        "ckpt",
+        device="cuda:0",
+        num_codebooks=2,
+    )
+    # Ignore the construction-time codec warm-up call added by #612.
+    fake_codec.calls = 0
+    encode = scheduler._fn
+
+    def make_payload(request_id: str) -> StagePayload:
+        state = HiggsTtsState(
+            reference_waveform=torch.zeros(1, 1, 16),
+            reference_cache_key="path:/tmp/ref.wav",
+            target_text="hello",
+            reference_text="speaker",
+            num_codebooks=2,
+        )
+        return StagePayload(
+            request_id=request_id,
+            request=OmniRequest(inputs={}),
+            data=state.to_dict(),
+        )
+
+    first = encode(make_payload("first"))
+    second = encode(make_payload("second"))
+
+    assert fake_codec.calls == 1
+    assert (
+        first.data["reference_codes_delayed"] == second.data["reference_codes_delayed"]
+    )
+    assert first.data["prompt_token_ids"] == [5, 3, 7]
+    assert second.data["prompt_token_ids"] == [5, 3, 7]
+    assert "reference_waveform" not in second.data
+    assert "reference_cache_key" not in second.data
+
+
+def test_higgs_preprocessing_uses_waveform_cache(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(stages.Tokenizer, "from_file", lambda _path: object())
+    monkeypatch.setattr(
+        stages,
+        "PreTrainedTokenizerFast",
+        lambda tokenizer_object: object(),
+    )
+    monkeypatch.setattr(stages, "HiggsTokenizerAdapter", lambda _tokenizer: object())
+
+    load_calls = 0
+
+    def fake_load_audio_to_24k(reference_audio):
+        nonlocal load_calls
+        load_calls += 1
+        return np.zeros(16, dtype=np.float32), 24000
+
+    monkeypatch.setattr(stages, "load_audio_to_24k", fake_load_audio_to_24k)
+
+    scheduler = stages.create_preprocessing_executor("ckpt", num_codebooks=2)
+    preprocess = scheduler._fn
+    ref_audio = tmp_path / "ref.wav"
+    ref_audio.write_bytes(b"fake wav bytes")
+
+    def make_payload(request_id: str) -> StagePayload:
+        return StagePayload(
+            request_id=request_id,
+            request=OmniRequest(
+                inputs={
+                    "text": "hello",
+                    "references": [{"audio_path": str(ref_audio), "text": "speaker"}],
+                },
+                params={},
+            ),
+            data={},
+        )
+
+    first = preprocess(make_payload("first"))
+    second = preprocess(make_payload("second"))
+    first_state = HiggsTtsState.from_dict(first.data)
+    second_state = HiggsTtsState.from_dict(second.data)
+
+    assert load_calls == 1
+    assert first_state.reference_cache_key == second_state.reference_cache_key
+    assert torch.equal(first_state.reference_waveform, second_state.reference_waveform)
+    assert (
+        first_state.reference_waveform.data_ptr()
+        != second_state.reference_waveform.data_ptr()
     )
 
 
