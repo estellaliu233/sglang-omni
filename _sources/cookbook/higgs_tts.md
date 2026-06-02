@@ -1,6 +1,6 @@
 # Higgs TTS
 
-[Higgs Audio v3 TTS](https://huggingface.co/boson-sglang/higgs-audio-v3-tts-4b-base)
+[Higgs Audio v3 TTS](https://huggingface.co/boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999)
 is a chat-native text-to-speech model from Boson AI built on a Qwen3-4B backbone. It generates
 24 kHz speech through 8 discrete codebooks and supports 100+ languages, voice cloning from a
 reference clip, and fine-grained inline control over emotion, style, sound effects, and prosody.
@@ -27,17 +27,9 @@ Higgs autoregressive decoder consumes interleaved text and audio tokens. Audio i
 
 ## Prerequisites
 
-```bash
-docker pull frankleeeee/sglang-omni:dev
-docker run -it --shm-size 32g --gpus all frankleeeee/sglang-omni:dev /bin/zsh
-```
+Install `sglang-omni` by following [Installation](../get_started/installation.md), then download the model:
 
 ```bash
-git clone https://github.com/sgl-project/sglang-omni.git
-cd sglang-omni
-uv venv .venv -p 3.12 && source .venv/bin/activate
-uv pip install -v .
-
 # Higgs TTS model is private; export your HF token before downloading.
 export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 hf download boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999
@@ -51,7 +43,6 @@ The pipeline is `preprocessing → audio_encoder → tts_engine → vocoder`.
 ```bash
 sgl-omni serve \
   --model-path boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999 \
-  --config examples/configs/higgs_tts.yaml \
   --port 8000
 ```
 
@@ -149,6 +140,8 @@ Reference output:
 Unlike a standard request where you wait for the full audio to be generated before receiving anything, streaming lets you start receiving and playing audio **while generation is still in progress**. This significantly reduces time-to-first-audio, which matters for real-time or interactive use cases.
 
 Higgs TTS implements streaming via [Server-Sent Events (SSE)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events). Each SSE event carries a base64-encoded WAV chunk. Your client can decode and play each chunk as it arrives, rather than buffering the entire response.
+
+Enable streaming by setting `"stream": true` in the request body. During generation, the vocoder emits incremental audio chunks; the terminal event is intentionally slim and carries metadata such as `sample_rate` and `usage` instead of repeating the full waveform. Inside the pipeline, audio chunks use the compact `audio_waveform` payload (`bytes` plus `audio_waveform_shape`, `audio_waveform_dtype`, and `sample_rate`), which the HTTP layer encodes into the SSE `audio.data` field.
 
 1. Use curl
 
