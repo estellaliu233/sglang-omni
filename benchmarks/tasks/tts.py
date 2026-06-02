@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import concurrent.futures
 import csv
 import functools
 import io
@@ -22,6 +23,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import aiohttp
+import numpy as np
+import requests
 import soundfile as sf
 import torch
 from jiwer import process_words
@@ -39,7 +42,11 @@ from benchmarks.benchmarker.utils import (
     save_json_results,
 )
 from benchmarks.dataset.seedtts import SampleInput, load_seedtts_samples
-from benchmarks.metrics.performance import build_speed_results
+from benchmarks.metrics.performance import (
+    build_speed_results,
+    load_tts_speed_summary,
+    print_saved_tts_speed_summary,
+)
 from benchmarks.metrics.speaker_similarity import WavLMSpeakerSimilarity
 from benchmarks.metrics.speaker_similarity_assets import (
     ensure_speaker_similarity_assets,
@@ -55,6 +62,11 @@ logger = logging.getLogger(__name__)
 
 TEXT_PREVIEW_LENGTH = 60
 SPEAKER_SIMILARITY_BATCH_SIZE = 8
+MOSS_TTS_TOKEN_COUNT_AUTO = "auto"
+MOSS_TTS_ZH_TOKENS_PER_CHAR = 3.098411951313033
+MOSS_TTS_EN_TOKENS_PER_CHAR = 0.8673376262755219
+MOSS_TTS_MIN_AUTO_TOKEN_COUNT = 32
+UTMOS_BATCH_SIZE = 8
 
 
 # ---------------------------------------------------------------------------
@@ -113,55 +125,211 @@ def normalize_text(text: str, lang: str) -> str:
     return normalizer(text)
 
 
+OMNI_WHISPER_MODEL_PATH = "openai/whisper-large-v3"
+OMNI_WHISPER_REQUEST_TIMEOUT_S = 300
+# Whisper encoder accepts at most ~30 s per request (nb_max_frames=3000).
+# transformers pipeline uses chunk_length_s=30; mirror that for long talker audio.
+OMNI_WHISPER_CHUNK_LENGTH_S = 30
+OMNI_WHISPER_CHUNK_STRIDE_S = 25
+OMNI_WHISPER_SAMPLE_RATE = 16000
+
+
+def _load_wav_mono_16k(wav_path: str) -> torch.Tensor:
+    import torchaudio
+
+    audio, sample_rate = torchaudio.load(wav_path)
+    if audio.ndim == 2 and audio.shape[0] > 1:
+        audio = audio.mean(dim=0, keepdim=True)
+    audio = audio.squeeze(0).to(torch.float32)
+    if sample_rate != OMNI_WHISPER_SAMPLE_RATE:
+        audio = torchaudio.functional.resample(
+            audio, sample_rate, OMNI_WHISPER_SAMPLE_RATE
+        )
+    return audio
+
+
+def _wav_bytes_from_mono_16k(audio: torch.Tensor) -> bytes:
+    pcm16 = (audio.clamp(-1.0, 1.0) * 32767.0).to(torch.int16).cpu()
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(OMNI_WHISPER_SAMPLE_RATE)
+        wav_file.writeframes(pcm16.numpy().tobytes())
+    return buffer.getvalue()
+
+
+def _post_omni_whisper_transcription(
+    asr: dict,
+    audio_bytes: bytes,
+    filename: str,
+    lang: str,
+) -> str:
+    response = requests.post(
+        f"http://127.0.0.1:{asr['router_port']}/v1/audio/transcriptions",
+        data={
+            "model": asr["model_path"],
+            "language": "en" if lang == "en" else lang,
+            "temperature": "0",
+        },
+        files={
+            "file": (
+                filename,
+                audio_bytes,
+                "audio/wav",
+            )
+        },
+        timeout=OMNI_WHISPER_REQUEST_TIMEOUT_S,
+        proxies={"http": None, "https": None},
+    )
+    response.raise_for_status()
+    return str(response.json()["text"])
+
+
+def _transcribe_omni_whisper(asr: dict, wav_path: str, lang: str) -> str:
+    audio = _load_wav_mono_16k(wav_path)
+    duration_s = float(audio.shape[0]) / OMNI_WHISPER_SAMPLE_RATE
+    if duration_s <= OMNI_WHISPER_CHUNK_LENGTH_S:
+        with open(wav_path, "rb") as audio_file:
+            return _post_omni_whisper_transcription(
+                asr,
+                audio_file.read(),
+                os.path.basename(wav_path),
+                lang,
+            )
+
+    chunk_samples = OMNI_WHISPER_CHUNK_LENGTH_S * OMNI_WHISPER_SAMPLE_RATE
+    stride_samples = OMNI_WHISPER_CHUNK_STRIDE_S * OMNI_WHISPER_SAMPLE_RATE
+    chunk_texts: list[str] = []
+    for start in range(0, int(audio.shape[0]), stride_samples):
+        chunk = audio[start : start + chunk_samples]
+        if chunk.numel() == 0:
+            break
+        chunk_bytes = _wav_bytes_from_mono_16k(chunk)
+        chunk_texts.append(
+            _post_omni_whisper_transcription(
+                asr,
+                chunk_bytes,
+                f"{os.path.basename(wav_path)}.chunk{start // stride_samples}.wav",
+                lang,
+            ).strip()
+        )
+        if start + chunk_samples >= audio.shape[0]:
+            break
+    return " ".join(text for text in chunk_texts if text)
+
+
+def load_omni_whisper_asr(
+    router_port: int,
+    *,
+    model_path: str = OMNI_WHISPER_MODEL_PATH,
+) -> dict:
+    """Return an ASR handle that transcribes via SGLang Omni Whisper router."""
+    return {
+        "type": "omni_whisper",
+        "router_port": router_port,
+        "model_path": model_path,
+    }
+
+
+QWEN3_ASR_MODEL_PATH = os.getenv("QWEN3_ASR_MODEL_PATH", "Qwen/Qwen3-ASR-1.7B")
+QWEN3_ASR_REQUEST_TIMEOUT_S = 300
+QWEN3_ASR_MAX_NEW_TOKENS = int(os.getenv("QWEN3_ASR_MAX_NEW_TOKENS", "128"))
+# ASR transcription fan-out for WER, not TTS generation concurrency.
+DEFAULT_ASR_TRANSCRIBE_CONCURRENCY = int(
+    os.getenv("QWEN3_ASR_CONCURRENCY", os.getenv("SEEDTTS_ASR_CONCURRENCY", "32"))
+)
+
+
+def load_qwen3_asr(
+    router_port: int,
+    *,
+    model_path: str = QWEN3_ASR_MODEL_PATH,
+) -> dict:
+    """Return an ASR handle that transcribes via a Qwen3-ASR sglang-omni router."""
+    return {
+        "type": "qwen3_asr",
+        "router_port": router_port,
+        "model_path": model_path,
+    }
+
+
+def _is_whisper_asr_model(model_path: str) -> bool:
+    return "whisper" in model_path.lower()
+
+
+def load_router_asr(
+    router_port: int,
+    *,
+    model_path: str = QWEN3_ASR_MODEL_PATH,
+) -> dict:
+    """Return an ASR handle backed by a running SGLang Omni ASR server."""
+    if _is_whisper_asr_model(model_path):
+        return load_omni_whisper_asr(router_port, model_path=model_path)
+    return load_qwen3_asr(router_port, model_path=model_path)
+
+
+def _transcribe_qwen3_asr(asr: dict, wav_path: str, lang: str) -> str:
+    """Transcribe one wav via the Qwen3-ASR server's /v1/audio/transcriptions.
+
+    Note: do NOT send temperature=0 — Qwen3-ASR degenerates under pure greedy
+    (the server bumps it to 0.01). ``language`` selects the forced prefix.
+    """
+    with open(wav_path, "rb") as audio_file:
+        response = requests.post(
+            f"http://127.0.0.1:{asr['router_port']}/v1/audio/transcriptions",
+            data={
+                "model": asr["model_path"],
+                "language": "en" if lang == "en" else lang,
+                "response_format": "json",
+                "max_new_tokens": str(QWEN3_ASR_MAX_NEW_TOKENS),
+            },
+            files={"file": (os.path.basename(wav_path), audio_file, "audio/wav")},
+            timeout=QWEN3_ASR_REQUEST_TIMEOUT_S,
+            proxies={"http": None, "https": None},
+        )
+    response.raise_for_status()
+    return str(response.json()["text"])
+
+
+def _resolve_asr_backend(
+    lang: str,
+    asr_device: str,
+    *,
+    asr_router_port: int | None = None,
+    asr_model_path: str = QWEN3_ASR_MODEL_PATH,
+    generation_mode: str | None = None,
+) -> dict:
+    if asr_router_port is not None:
+        return load_router_asr(asr_router_port, model_path=asr_model_path)
+    return load_asr_model(lang, asr_device, generation_mode)
+
+
 def load_asr_model(lang: str, device: str, generation_mode: str | None = None):
-    """Load ASR model for voice clone WER evaluation."""
+    """Legacy local ASR entry point.
+
+    WER now runs through SGLang Omni's OpenAI-compatible transcription endpoint.
+    Start an ASR server with ``sglang_omni.cli serve`` and pass its port instead
+    of loading local ASR backends in-process.
+    """
     mode_suffix = f" for {generation_mode} generation" if generation_mode else ""
-    if lang == "en":
-        from transformers import pipeline
-
-        logger.info(
-            f"Loading Whisper-large-v3 on {device}{mode_suffix} "
-            "(pipeline, chunk_length_s=30)..."
-        )
-        t0 = time.perf_counter()
-        pipe = pipeline(
-            "automatic-speech-recognition",
-            model="openai/whisper-large-v3",
-            chunk_length_s=30,
-            device=device,
-        )
-        logger.info(f"Whisper loaded in {time.perf_counter() - t0:.1f}s{mode_suffix}")
-        return {"type": "whisper", "pipeline": pipe}
-    elif lang == "zh":
-        from funasr import AutoModel
-
-        logger.info(f"Loading FunASR paraformer-zh{mode_suffix}...")
-        t0 = time.perf_counter()
-        model = AutoModel(model="paraformer-zh")
-        logger.info(f"FunASR loaded in {time.perf_counter() - t0:.1f}s{mode_suffix}")
-        return {"type": "funasr", "model": model}
-    else:
+    del device
+    if lang not in {"en", "zh"}:
         raise ValueError(f"Unsupported language: {lang}")
+    raise ValueError(
+        "WER transcription requires a running SGLang Omni ASR server"
+        f"{mode_suffix}. Start Qwen3-ASR (default "
+        f"{QWEN3_ASR_MODEL_PATH}) or {OMNI_WHISPER_MODEL_PATH} and pass "
+        "asr_router_port."
+    )
 
 
 def transcribe(asr: dict, wav_path: str, lang: str, device: str) -> str:
-    if asr["type"] == "whisper":
-        # pipeline internally chunks at chunk_length_s=30 with stride overlap,
-        # so outputs longer than 30 s are transcribed end-to-end rather than
-        # silently truncated to the first 30 s.
-        result = asr["pipeline"](
-            wav_path,
-            generate_kwargs={"language": "english", "task": "transcribe"},
-        )
-        return result["text"]
-    elif asr["type"] == "funasr":
-        import zhconv
-
-        res = asr["model"].generate(input=wav_path, batch_size_s=300)
-        transcription = res[0]["text"]
-        return zhconv.convert(transcription, "zh-cn")
-    else:
-        raise ValueError(f"Unknown ASR type: {asr['type']}")
+    if asr["type"] == "qwen3_asr":
+        return _transcribe_qwen3_asr(asr, wav_path, lang)
+    if asr["type"] == "omni_whisper":
+        return _transcribe_omni_whisper(asr, wav_path, lang)
+    raise ValueError(f"Unknown ASR type: {asr['type']}")
 
 
 def transcribe_and_compute_wer(
@@ -201,12 +369,22 @@ def compute_text_audio_consistency(
     request_results: list[RequestResult],
     lang: str,
     asr_device: str,
+    *,
+    asr_router_port: int | None = None,
+    asr_model_path: str = QWEN3_ASR_MODEL_PATH,
+    asr_concurrency: int = DEFAULT_ASR_TRANSCRIBE_CONCURRENCY,
 ) -> dict:
     """WER between each request's text output (ref) and ASR-transcribed audio (hyp)."""
-    asr = load_asr_model(lang, asr_device)
+    asr = _resolve_asr_backend(
+        lang,
+        asr_device,
+        asr_router_port=asr_router_port,
+        asr_model_path=asr_model_path,
+    )
 
-    outputs: list[SampleOutput] = []
-    for result in request_results:
+    outputs_by_idx: list[SampleOutput | None] = [None] * len(request_results)
+    pending: list[tuple[int, RequestResult, SampleOutput]] = []
+    for idx, result in enumerate(request_results):
         ref_text = " ".join(result.text.split())
         out = SampleOutput(
             sample_id=result.request_id,
@@ -216,11 +394,41 @@ def compute_text_audio_consistency(
         )
         if not result.is_success or not result.wav_path:
             out.error = result.error or "No audio in response"
-            outputs.append(out)
+            outputs_by_idx[idx] = out
             continue
-        outputs.append(
-            transcribe_and_compute_wer(out, result.wav_path, asr, lang, asr_device)
+        pending.append((idx, result, out))
+
+    def _transcribe_pending(
+        result: RequestResult,
+        output: SampleOutput,
+    ) -> SampleOutput:
+        asr_t0 = time.perf_counter()
+        output = transcribe_and_compute_wer(
+            output,
+            result.wav_path,
+            asr,
+            lang,
+            asr_device,
         )
+        output.asr_latency_s = time.perf_counter() - asr_t0
+        return output
+
+    asr_concurrency = max(1, int(asr_concurrency))
+    if asr_concurrency == 1:
+        for idx, result, output in pending:
+            outputs_by_idx[idx] = _transcribe_pending(result, output)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=asr_concurrency,
+        ) as executor:
+            future_to_idx = {
+                executor.submit(_transcribe_pending, result, output): idx
+                for idx, result, output in pending
+            }
+            for future in concurrent.futures.as_completed(future_to_idx):
+                outputs_by_idx[future_to_idx[future]] = future.result()
+
+    outputs = [output for output in outputs_by_idx if output is not None]
 
     per_sample = [
         {
@@ -247,6 +455,9 @@ def compute_text_audio_consistency_from_records(
     audio_dir: str | None = None,
     sample_id_key: str = "sample_id",
     text_key: str = "raw_response",
+    asr_router_port: int | None = None,
+    asr_model_path: str = QWEN3_ASR_MODEL_PATH,
+    asr_concurrency: int = DEFAULT_ASR_TRANSCRIBE_CONCURRENCY,
 ) -> dict:
     """Compute WER from saved eval records after the inference server is stopped."""
     request_results: list[RequestResult] = []
@@ -266,7 +477,14 @@ def compute_text_audio_consistency_from_records(
                 error=str(record.get("error") or ""),
             )
         )
-    return compute_text_audio_consistency(request_results, lang, asr_device)
+    return compute_text_audio_consistency(
+        request_results,
+        lang,
+        asr_device,
+        asr_router_port=asr_router_port,
+        asr_model_path=asr_model_path,
+        asr_concurrency=asr_concurrency,
+    )
 
 
 def save_wer_results(
@@ -362,12 +580,14 @@ def run_seedtts_similarity(
     generated_path = os.path.join(output_dir, "generated.json")
     with open(generated_path) as f:
         generated: list[dict] = json.load(f)
+    if config.max_samples is not None:
+        generated = generated[: config.max_samples]
     logger.info(f"Loaded {len(generated)} entries from {generated_path}")
 
     split = config.lang
     ref_audio_by_id = {
         sample.sample_id: sample.ref_audio
-        for sample in load_seedtts_samples(config.meta, split=split)
+        for sample in load_seedtts_samples(config.meta, config.max_samples, split=split)
     }
     device = config.device
     if "cuda" in device:
@@ -494,12 +714,145 @@ def run_seedtts_similarity(
                 "model": config.model,
                 "meta": config.meta,
                 "device": device,
+                "max_samples": config.max_samples,
                 "similarity_checkpoint": str(assets.finetune_checkpoint),
             },
             "per_sample": per_sample,
         },
         config.output_dir,
         "similarity_results.json",
+    )
+    return {"summary": metrics, "per_sample": per_sample}
+
+
+class SeedttsUTMOSConfig(Protocol):
+    """Subset of config fields the shared UTMOS pipeline reads."""
+
+    model: str
+    output_dir: str
+    device: str
+
+
+def run_seedtts_utmos(
+    config: SeedttsUTMOSConfig,
+    *,
+    log_per_sample: bool = False,
+) -> dict:
+    """Compute UTMOS MOS scores for saved SeedTTS generated audio."""
+    from benchmarks.metrics.utmos import UTMOSScorer
+
+    output_dir = os.path.abspath(config.output_dir)
+    generated_path = os.path.join(output_dir, "generated.json")
+    with open(generated_path) as f:
+        generated: list[dict] = json.load(f)
+    logger.info(f"Loaded {len(generated)} entries from {generated_path}")
+
+    per_sample: list[dict | None] = [None] * len(generated)
+    scoreable: list[dict] = []
+
+    for idx, entry in enumerate(generated):
+        sample_id = entry.get("sample_id")
+        wav_path = entry.get("wav_path")
+        if (
+            isinstance(sample_id, str)
+            and sample_id
+            and entry.get("is_success")
+            and isinstance(wav_path, str)
+            and wav_path
+            and os.path.isfile(wav_path)
+        ):
+            scoreable.append({**entry, "_idx": idx})
+            continue
+
+        if not isinstance(sample_id, str) or not sample_id:
+            reason = "sample_id missing from generated.json entry"
+        elif not entry.get("is_success"):
+            reason = entry.get("error") or "generation reported is_success=False"
+        elif not (isinstance(wav_path, str) and wav_path):
+            reason = "wav_path missing from generated.json entry"
+        else:
+            reason = f"wav file not on disk: {wav_path}"
+
+        per_sample[idx] = {
+            "id": sample_id or wav_path,
+            "wav_path": wav_path,
+            "utmos_score": None,
+            "is_success": False,
+            "error": reason,
+        }
+
+    if not scoreable:
+        raise RuntimeError(
+            "UTMOS: no scoreable samples "
+            f"({sum(1 for r in per_sample if r is not None)}/{len(generated)} skipped). "
+            "Refusing to write empty utmos_results.json."
+        )
+
+    device = config.device
+    if "cuda" in device:
+        torch.cuda.set_device(device)
+        logger.info(f"Set UTMOS CUDA device to {device}")
+
+    scorer = UTMOSScorer(device=device)
+    scores: list[float] = []
+
+    for start in tqdm(
+        range(0, len(scoreable), UTMOS_BATCH_SIZE),
+        desc="UTMOS scoring",
+    ):
+        batch = scoreable[start : start + UTMOS_BATCH_SIZE]
+        wav_paths = [entry["wav_path"] for entry in batch]
+        batch_scores = scorer.score_batch(wav_paths)
+        if len(batch_scores) != len(batch):
+            raise RuntimeError(
+                f"UTMOS scorer returned {len(batch_scores)} scores for {len(batch)} inputs"
+            )
+
+        for entry, score in zip(batch, batch_scores):
+            scores.append(score)
+            per_sample[entry["_idx"]] = {
+                "id": entry["sample_id"],
+                "wav_path": entry["wav_path"],
+                "utmos_score": round(score, 4),
+                "is_success": True,
+                "error": None,
+            }
+            if log_per_sample:
+                logger.info(f"[{entry['sample_id']}] utmos={score:.3f}")
+
+    n_skipped = sum(1 for r in per_sample if r is None or not r["is_success"])
+    n_scored = len(scores)
+
+    metrics = {
+        "utmos_mean": round(float(np.mean(scores)), 4),
+        "utmos_median": round(float(np.median(scores)), 4),
+        "utmos_p5": round(float(np.percentile(scores, 5)), 4),
+        "utmos_p95": round(float(np.percentile(scores, 95)), 4),
+        "total_samples": len(generated),
+        "evaluated": n_scored,
+        "skipped": n_skipped,
+    }
+    print(
+        f"UTMOS: mean={metrics['utmos_mean']:.4f} "
+        f"({n_scored}/{len(generated)} evaluated, {n_skipped} skipped)"
+    )
+    if n_skipped:
+        logger.warning(
+            "UTMOS: %d samples skipped (see per_sample for details).",
+            n_skipped,
+        )
+
+    save_json_results(
+        {
+            "summary": metrics,
+            "config": {
+                "model": config.model,
+                "device": device,
+            },
+            "per_sample": per_sample,
+        },
+        config.output_dir,
+        "utmos_results.json",
     )
     return {"summary": metrics, "per_sample": per_sample}
 
@@ -529,6 +882,8 @@ class SeedttsTranscribeConfig(Protocol):
     output_dir: str
     lang: str
     device: str
+    asr_model_path: str
+    asr_concurrency: int
 
 
 def build_base_url(config: ServerEndpointConfig) -> str:
@@ -557,6 +912,13 @@ def _transcribe_one_entry(
     output = transcribe_and_compute_wer(output, entry["wav_path"], asr, lang, device)
     output.asr_latency_s = time.perf_counter() - asr_t0
     return output
+
+
+def _resolve_asr_concurrency(config: SeedttsTranscribeConfig) -> int:
+    value = getattr(config, "asr_concurrency", DEFAULT_ASR_TRANSCRIBE_CONCURRENCY)
+    if value is None:
+        value = 1
+    return max(1, int(value))
 
 
 def _log_transcribe_result(
@@ -593,6 +955,7 @@ def run_seedtts_transcribe(
     wer_config: dict,
     generation_mode: str | None = None,
     log_per_sample: bool = False,
+    asr_router_port: int | None = None,
 ) -> dict:
     """Transcribe saved audio, compute WER + ASR-speed metrics, and persist them.
 
@@ -605,37 +968,88 @@ def run_seedtts_transcribe(
         - ``asr_speed``:   ASR transcription latency/throughput metrics
         - ``per_sample``:  list[SampleOutput] with per-sample details
     """
-    if "cuda" in config.device:
-        torch.cuda.set_device(config.device)
-        logger.info(f"Set ASR CUDA device to {config.device}")
-
     generated_path = os.path.join(config.output_dir, "generated.json")
     with open(generated_path) as f:
         generated: list[dict] = json.load(f)
     logger.info(f"Loaded {len(generated)} entries from {generated_path}")
 
-    asr = load_asr_model(config.lang, config.device, generation_mode)
+    asr_model_path = getattr(config, "asr_model_path", QWEN3_ASR_MODEL_PATH)
+    asr = _resolve_asr_backend(
+        config.lang,
+        config.device,
+        asr_router_port=asr_router_port,
+        asr_model_path=asr_model_path,
+        generation_mode=generation_mode,
+    )
 
     tqdm_desc = (
         f"Transcribing ({config.lang})" if not generation_mode else "WER transcribe"
     )
-    outputs: list[SampleOutput] = []
-    for idx, entry in enumerate(tqdm(generated, desc=tqdm_desc)):
-        output = _transcribe_one_entry(entry, asr, config.lang, config.device)
-        outputs.append(output)
-        _log_transcribe_result(
-            idx=idx,
-            total=len(generated),
-            entry=entry,
-            output=output,
-            log_per_sample=log_per_sample,
-        )
+    asr_concurrency = _resolve_asr_concurrency(config)
+    outputs_by_idx: list[SampleOutput | None] = [None] * len(generated)
+    asr_wall_start_s = time.perf_counter()
+    if asr_concurrency == 1:
+        for idx, entry in enumerate(tqdm(generated, desc=tqdm_desc)):
+            output = _transcribe_one_entry(entry, asr, config.lang, config.device)
+            outputs_by_idx[idx] = output
+            _log_transcribe_result(
+                idx=idx,
+                total=len(generated),
+                entry=entry,
+                output=output,
+                log_per_sample=log_per_sample,
+            )
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=asr_concurrency,
+        ) as executor:
+            future_to_idx = {
+                executor.submit(
+                    _transcribe_one_entry,
+                    entry,
+                    asr,
+                    config.lang,
+                    config.device,
+                ): idx
+                for idx, entry in enumerate(generated)
+            }
+            with tqdm(total=len(generated), desc=tqdm_desc) as progress:
+                for future in concurrent.futures.as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    entry = generated[idx]
+                    output = future.result()
+                    outputs_by_idx[idx] = output
+                    _log_transcribe_result(
+                        idx=idx,
+                        total=len(generated),
+                        entry=entry,
+                        output=output,
+                        log_per_sample=log_per_sample,
+                    )
+                    progress.update(1)
+
+    asr_wall_time_s = time.perf_counter() - asr_wall_start_s
+    outputs = [output for output in outputs_by_idx if output is not None]
 
     wer_metrics = calculate_wer_metrics(outputs, config.lang)
-    asr_metrics = calculate_asr_speed_metrics(outputs)
+    asr_metrics = calculate_asr_speed_metrics(outputs, wall_time_s=asr_wall_time_s)
+    asr_metrics["asr_model"] = asr_model_path
+    asr_metrics["asr_concurrency"] = asr_concurrency
 
-    print_asr_speed_summary(asr_metrics, config.model)
-    print_wer_summary(wer_metrics, config.model, generation_mode)
+    tts_speed_summary = load_tts_speed_summary(config.output_dir)
+    print_saved_tts_speed_summary(
+        config.output_dir,
+        config.model,
+        concurrency=wer_config.get("concurrency"),
+        generation_mode=generation_mode,
+    )
+    print_wer_summary(
+        wer_metrics,
+        config.model,
+        generation_mode,
+        tts_speed_summary=tts_speed_summary,
+    )
+    print_asr_speed_summary(asr_metrics, asr_model_path)
 
     save_wer_results(outputs, wer_metrics, wer_config, config.output_dir)
     save_json_results(asr_metrics, config.output_dir, "asr_speed_results.json")
@@ -1034,6 +1448,8 @@ def _build_tts_payload(
     no_ref_audio: bool = False,
     ref_format: str = "flat",
     voice: str | None = None,
+    task_type: str | None = None,
+    instructions: str | None = None,
     **gen_kwargs,
 ) -> dict:
     payload: dict = {
@@ -1051,12 +1467,48 @@ def _build_tts_payload(
             payload["ref_text"] = sample.ref_text
     if voice is not None:
         payload["voice"] = voice
-    for key, value in gen_kwargs.items():
+    if task_type is not None:
+        payload["task_type"] = task_type
+    if instructions is not None:
+        payload["instructions"] = instructions
+    resolved_gen_kwargs = _resolve_tts_generation_kwargs(sample, gen_kwargs)
+    for key, value in resolved_gen_kwargs.items():
         if value is not None:
             payload[key] = value
     if stream:
         payload["stream"] = True
     return payload
+
+
+def estimate_moss_tts_duration_tokens(text: str) -> int:
+    """Estimate MOSS-TTS duration tokens using OpenMOSS app defaults."""
+    normalized = text or ""
+    effective_len = max(len(normalized), 1)
+    zh_chars = sum(1 for ch in normalized if "\u4e00" <= ch <= "\u9fff")
+    en_chars = sum(1 for ch in normalized if ("A" <= ch <= "Z") or ("a" <= ch <= "z"))
+    factor = (
+        MOSS_TTS_ZH_TOKENS_PER_CHAR
+        if zh_chars and zh_chars >= en_chars
+        else MOSS_TTS_EN_TOKENS_PER_CHAR
+    )
+    return max(MOSS_TTS_MIN_AUTO_TOKEN_COUNT, int(effective_len * factor))
+
+
+def _resolve_tts_generation_kwargs(
+    sample: SampleInput,
+    gen_kwargs: dict,
+) -> dict:
+    token_count = gen_kwargs.get("token_count")
+    if not isinstance(token_count, str):
+        return gen_kwargs
+
+    normalized = token_count.strip().lower()
+    if normalized != MOSS_TTS_TOKEN_COUNT_AUTO:
+        return gen_kwargs
+
+    resolved = dict(gen_kwargs)
+    resolved["token_count"] = estimate_moss_tts_duration_tokens(sample.target_text)
+    return resolved
 
 
 def _parse_response_headers(result: RequestResult, headers: dict) -> None:
@@ -1248,6 +1700,8 @@ def make_tts_send_fn(
     no_ref_audio: bool = False,
     ref_format: str = "flat",
     voice: str | None = None,
+    task_type: str | None = None,
+    instructions: str | None = None,
     save_audio_dir: str | None = None,
     **gen_kwargs,
 ) -> SendFn:
@@ -1267,6 +1721,8 @@ def make_tts_send_fn(
             no_ref_audio=no_ref_audio,
             ref_format=ref_format,
             voice=voice,
+            task_type=task_type,
+            instructions=instructions,
             **gen_kwargs,
         )
         start_time = time.perf_counter()

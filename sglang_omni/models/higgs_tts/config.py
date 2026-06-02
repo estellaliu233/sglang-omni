@@ -43,9 +43,14 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             name="tts_engine",
             process="pipeline",
             factory=f"{_PKG}.stages.create_sglang_tts_engine_executor",
-            factory_args={"device": "cuda", "max_new_tokens": 2048},
+            factory_args={
+                "device": "cuda",
+                "max_new_tokens": 2048,
+                "enable_async_decode": True,
+            },
             gpu=0,
             next="vocoder",
+            stream_to=["vocoder"],
         ),
         StageConfig(
             name="vocoder",
@@ -54,6 +59,7 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             factory_args={"device": "cuda"},
             gpu=0,
             terminal=True,
+            can_accept_stream_before_payload=True,
         ),
     ]
 

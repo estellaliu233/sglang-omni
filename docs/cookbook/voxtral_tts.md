@@ -9,17 +9,9 @@ and is served through the OpenAI-compatible `/v1/audio/speech` endpoint.
 
 ## Prerequisites
 
-```bash
-docker pull frankleeeee/sglang-omni:dev
-docker run -it --shm-size 32g --gpus all frankleeeee/sglang-omni:dev /bin/zsh
-```
+Install `sglang-omni` by following [Installation](../get_started/installation.md), then install the Voxtral-specific tokenizer and download the model:
 
 ```bash
-git clone https://github.com/sgl-project/sglang-omni.git
-cd sglang-omni
-uv venv .venv -p 3.12 && source .venv/bin/activate
-uv pip install -v .
-
 # Voxtral preprocessing uses Mistral's Tekken tokenizer from mistral-common.
 uv pip install 'mistral-common[audio]>=1.8.0'
 
@@ -143,7 +135,7 @@ Whisper-large-v3. Hardware: 1× H200 SXM.
 | Throughput (req/s) | 5.40 |
 | Completed / failed requests | 1088 / 0 |
 
-Reproduce with the SeedTTS command in our [seedTTS benchmark](./benchmarks/README.md). The Voxtral
+Reproduce with the SeedTTS command in our [seedTTS benchmark](../../benchmarks/README.md). The Voxtral
 model card also quotes ~70 ms first-audio latency at concurrency 1; the table above is a
 throughput-oriented run at concurrency 16, so its RTF reflects batched load rather than the
 latency-optimized single-stream figure. Output is 24 kHz.

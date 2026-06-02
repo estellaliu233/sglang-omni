@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 
+from sglang_omni.http.favicon import register_favicon
 from sglang_omni_router.config import RouterConfig, WorkerConfig
 from sglang_omni_router.health import HealthChecker
 from sglang_omni_router.proxy import ProxyHandler, filter_request_headers
@@ -96,6 +97,7 @@ def create_app(
     )
 
     register_routes(app, workers, proxy, config)
+    register_favicon(app)
     return app
 
 
@@ -279,6 +281,10 @@ def register_routes(
     @app.post("/v1/audio/speech")
     async def audio_speech(request: Request) -> Response:
         return await proxy.forward_model_request(request, "/v1/audio/speech")
+
+    @app.post("/v1/audio/transcriptions")
+    async def audio_transcriptions(request: Request) -> Response:
+        return await proxy.forward_model_request(request, "/v1/audio/transcriptions")
 
 
 def _pool_summary(

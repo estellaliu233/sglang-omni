@@ -11,8 +11,11 @@ tests/
 │   ├── conftest.py
 │   ├── test_qwen3_omni_*_ci.py
 │   ├── test_qwen3_omni_videoamme_talker_tp2_ci.py
-│   └── test_s2pro_tts_ci.py
+│   ├── test_tts_ci.py
+│   └── test_qwen3_asr_ci.py
 └── unit_test/
+    ├── benchmarks/
+    │   └── test_dataset_regressions.py
     ├── fixtures/
     │   ├── fish_fakes.py
     │   ├── pipeline_fakes.py
@@ -46,20 +49,32 @@ tests/
     │   ├── test_talker.py
     │   └── test_text_template.py
     ├── ming_omni/
+    │   ├── test_omni_serve.py
     │   ├── test_pipeline.py
     │   ├── test_talker.py
+    │   ├── test_talker_voice_validation.py
     │   ├── test_thinker.py
     │   ├── test_tokenizer.py
-    │   └── test_tp.py
+    │   ├── test_tp.py
+    │   └── test_vision_patch_embed_linear.py
+    ├── qwen3_asr/
+    │   ├── test_pipeline.py
+    │   └── test_request_builders.py
     ├── qwen3_tts/
     │   └── test_pipeline.py
     ├── higgs_tts/
+    │   ├── test_async_decode_runner.py
     │   ├── test_batched_step.py
+    │   ├── test_cli_async_decode.py
     │   ├── test_pipeline.py
     │   └── test_request_builders.py
     ├── router/
     │   ├── test_app.py
     │   └── test_core.py
+    ├── profiler/
+    │   ├── test_event_recorder.py
+    │   ├── test_stop_run_id.py
+    │   └── test_views.py
     ├── serve/
     │   └── test_openai_api.py
     ├── fishaudio_s2_pro/
@@ -95,8 +110,8 @@ Tag each test with the marker that matches its lane and use it to filter runs.
   out hardware needs.
 - `docs`: documented-example tests in `docs/`. Verify documented request
   shapes and CLI snippets still work.
-- `s2pro_stage(name)`: in-file CI stage selector for S2-Pro benchmarks.
-  Combined with `--s2pro-stage` (see `test_model/conftest.py`).
+- `tts_stage(name)`: in-file CI stage selector for TTS benchmarks.
+  Combined with `--tts-stage` (see `test_model/conftest.py`).
 
 
 ## Root Files
@@ -148,7 +163,34 @@ Relevant model CI ownership:
 - `qwen3_omni_thinker_server` / `qwen3_omni_talker_server`: expose the shared
   router-backed Qwen3-Omni endpoint from `conftest.py`.
 - `test_qwen3_omni_tts_ci.py`: gates the SeedTTS speed/WER path through the
-  router and verifies both colocated workers receive traffic.
+  router at TTS generation concurrency 16 and verifies both colocated workers
+  receive traffic. WER reuses saved audio after the Qwen3-Omni server is
+  stopped, then transcribes through Qwen3-ASR at concurrency 32.
+- `test_qwen3_asr_ci.py`: Qwen3-ASR correctness + speed via SGLang Omni
+  router (`/v1/audio/transcriptions`). Uses the first 20 English SeedTTS
+  clips; writes `qwen3_asr_results.json` for threshold calibration
+  (`qwen3-asr-v1` in `tune-ci-thresholds`). Its stdout uses the same boxed
+  summary style as the other benchmark stages: `ASR WER Benchmark Result`
+  followed by `ASR Speed Benchmark Result`.
+- `utils.py`: shared fixture/helpers for talker/TTS WER CI —
+  stops the upstream model server, runs `ensure_gpus_idle.sh`, then launches
+  a Qwen3-ASR router. It also owns the WER ASR concurrency constant
+  (`QWEN3_ASR_WER_CONCURRENCY`, currently 32). Used by Qwen3 talker WER tests
+  and TTS WER tests instead of the in-process transformers Whisper pipeline.
+- Talker / video WER CI (`test_qwen3_omni_*_talker_ci.py`, `test_tts_ci.py`):
+  generate audio with the model router first, tear down that server, free both
+  GPUs, then transcribe saved WAVs through the ASR router. Qwen3-Omni
+  talker/TTS generation concurrency is 16, including the
+  `videoamme_talker_tp2` stage; ASR/WER transcription concurrency is 32.
+- CI env alignment on the H20 repro host: `source .github/scripts/ci_env.sh`
+  then `source omni/bin/activate`.
+  Omni CI (`omni-ci.yaml`) runs benchmark suites sequentially after one shared
+  setup: TTS CI → Qwen3-Omni CI → PR Test (`test.yaml` unit tests). A failure in
+  an earlier suite does not skip later ones; only a failed setup blocks the chain.
+  Full WER sweep: `.github/scripts/run_all_wer_ci_aligned.sh` (milestones on
+  stdout; details in `/tmp/wer_ci_qwen3.log` and `/tmp/wer_ci_tts.log`).
+- GPU handoff between stages: `.github/scripts/ensure_gpus_idle.sh` (kills orphan
+  spawn/router workers, waits for VRAM below threshold).
 - `qwen3_omni_vision_sglang_env`: session-scoped SGLang dist + DP-attention
   init from `conftest.py`, shared by every Qwen3-Omni vision-encoder benchmark
   module — avoids re-initializing the process-global TP group when the combined
@@ -161,6 +203,36 @@ Relevant model CI ownership:
   `--concurrency {1,2,4,8,16,all}`: scope an S2-Pro CI sweep without editing
   source.
 
+### Ming TP Parity
+
+`tests/test_model/test_ming_tp_parity_ci.py` launches Ming-Omni twice, first
+with TP=1 and then with TP=N, and compares deterministic text responses. It is
+skipped by default because it requires a Ming checkpoint and enough GPUs.
+
+Remote GPU example:
+
+```bash
+RUN_MING_TP_PARITY=1 \
+MING_TP_PARITY_TP_SIZE=4 \
+MING_TP_PARITY_CUDA_VISIBLE_DEVICES=0,1,2,3,4 \
+MING_OMNI_MODEL_PATH=inclusionAI/Ming-flash-omni-2.0 \
+MING_OMNI_MODEL_NAME=ming-omni \
+python3 -m pytest tests/test_model/test_ming_tp_parity_ci.py -q -s
+```
+
+- `test_tts_ci.py`: default TTS CI gate. It starts the TTS managed router
+  with two one-GPU workers using the default model config, runs the
+  full SeedTTS EN set (1088 samples) in non-streaming / streaming stages at
+  concurrency 16, and frees the server GPUs before ASR/WER and
+  speaker-similarity checks. Non-streaming and streaming WER pass the selected
+  TTS generation concurrency into the result config while keeping Qwen3-ASR
+  transcription concurrency at 32.
+- `test_tts_consistency_artifacts.py`: CPU-only stage-3 check that compares
+  TTS non-stream and streaming `speed_results.json` under
+  `${OMNI_CI_HOME}/tts-stage-results/{nonstream,stream}/`.
+- CLI flags `--tts-stage {tts-stage-1-nonstream,tts-stage-2-stream,tts-stage-3-consistency,all}`
+  and `--concurrency {1,2,4,8,16,all}`: scope a TTS CI sweep without
+  editing source.
 
 ## `unit_test/`
 
@@ -182,8 +254,12 @@ that happened to contain an older version of the test.
   - runtime schema/adapter behavior
   - coordinator behavior
   - stage routing
+  - local-object fan-out selector contracts, including negative coverage for
+    shared mutable payload containers while preserving tensor leaf sharing
   - stage process environment
   - relay handling
+  - stream relay/IPC selector contracts, including negative coverage for CPU
+    tensor metadata and large inline metadata on same-GPU stream chunks
   - GPU memory accounting helpers
   - IPC lifecycle
   - scheduler batching
@@ -191,6 +267,13 @@ that happened to contain an older version of the test.
   - scheduler concurrency
   - scheduler callable contracts, including sync wrappers and callable objects
     that return awaitables.
+- `unit_test/benchmarks/`: Benchmark dataset/loading regression tests.
+- `unit_test/qwen3_asr/`: Qwen3-ASR unit tests:
+  - pipeline config and stage factory concurrency defaults
+  - single-source audio token length formula used by both processor and
+    request builder paths
+  - token-level result adapter marker handling, avoiding decode/encode
+    text round-trips for byte-level BPE output.
 - `unit_test/qwen3_omni/` Qwen3-Omni unit tests:
 
   - public CLI/config behavior
@@ -200,7 +283,8 @@ that happened to contain an older version of the test.
   - tokenizer and preprocessing fallback behavior
   - memory flag contracts
   - colocation config and SGLang AR budget contracts
-  - `PipelineState` request builders
+  - `Qwen3OmniPipelineState` request builders, including projected payload container
+    isolation for mutable streaming state
   - talker behavior, including partial-prefix startup gate, the real
     `_build_talker_request_data` propagation contract (input_ids,
     tts_pad_embed, sampling_seed, fallback chunks, thinker_done), and the
@@ -213,21 +297,26 @@ that happened to contain an older version of the test.
 - `unit_test/ming_omni/` Ming-Omni unit tests:
 
   - text + speech pipeline config and stage schema
-  - launcher argparse, GPU placement, and TP wiring
+  - omni serve CLI/config merge, default speech vs. text-only selection,
+    launcher handoff, GPU placement, TP wiring, and unsupported flag capability
+    boundaries
   - stage factory and scheduler contracts (preprocessing, encoders, thinker, talker, decode)
   - thinker bootstrap registration and Ming model runner wiring
   - multimodal embed injection (per-modality consumed state, pad-value fallback, short-embeds detection)
   - image/vision encoder TP context preservation
   - audio/image preprocessor placeholder construction and cache-key plumbing
   - talker executor request gating and result-builder modality merging
+  - talker voice-preset validation (load-time manifest / wav existence, request-time prompt_wav_path priority), duration-cap heuristic, and `generate()` final-chunk flush across stop-token and step-ceiling exits
   - Bailing tokenizer loader fallback for vocab compatibility
-  - TP topology validation (rank-specific stage specs, talker/thinker GPU collision detection, server_args alignment before infra init).
+  - TP topology validation (rank-specific stage specs, talker/thinker GPU collision detection, server_args alignment before infra init)
+  - vision encoder `patch_embed` numerical equivalence: `nn.Conv3d` vs `F.linear` reshape at the substitution boundary, using synthetic weights without loading real Ming checkpoints.
 
-- `unit_test/qwen3_tts/`: Qwen3-TTS Base unit tests:
+- `unit_test/qwen3_tts/`: Qwen3-TTS unit tests:
   - pipeline config and registry contracts
   - OmniScheduler-backed AR stage factory wiring
   - request mapping for `ref_audio` / `ref_text` and `references`
   - model-owned default preservation for language and sampling parameters
+  - Base, CustomVoice, and VoiceDesign request validation
   - voice-clone reference validation
   - pipeline payload state serialization.
 
@@ -235,7 +324,9 @@ that happened to contain an older version of the test.
   - OmniScheduler-backed AR stage factory wiring
   - sampler-driven finish handling for eager and CUDA-graph paths
   - request builder sampling normalization and server-side token caps
-  - model slot cleanup and engine timing in scheduler result adapters.
+  - model slot cleanup and engine timing in scheduler result adapters
+  - async-decode one-step-lookahead parity with the synchronous collect path
+  - async-decode default-on config + `--async-decode` tri-state CLI override.
 
 - `unit_test/router/`: SGLang-Omni Router unit tests:
   - router CLI/config behavior

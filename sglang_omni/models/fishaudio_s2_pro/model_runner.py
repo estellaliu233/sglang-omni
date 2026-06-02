@@ -75,15 +75,22 @@ class FishS2ProModelRunner(ModelRunner):
         self._semantic_end_id = int(self.model._semantic_end_id)
         self._im_end_token_id = int(self.model._im_end_token_id)
 
-    def prepare_prefill(self, forward_batch, schedule_batch, requests):
+    def before_prefill(self, forward_batch, schedule_batch, requests):
         del schedule_batch
         self._sync_decode_state(requests)
         input_embeds = self._build_prefill_input_embeds(forward_batch, requests)
         if input_embeds is not None:
             forward_batch.input_embeds = input_embeds
-        return None
 
-    def prepare_decode(self, forward_batch, schedule_batch, requests):
+    def before_decode(
+        self,
+        forward_batch,
+        schedule_batch,
+        requests,
+        *,
+        is_lookahead: bool = False,
+    ):
+        del is_lookahead
         del schedule_batch
         input_ids = forward_batch.input_ids
         batch_size = input_ids.shape[0]
@@ -105,7 +112,6 @@ class FishS2ProModelRunner(ModelRunner):
                     dtype=self.model._vq_codes.dtype,
                 )
             )
-        return None
 
     def post_prefill(self, result, forward_batch, schedule_batch, requests):
         del forward_batch, schedule_batch

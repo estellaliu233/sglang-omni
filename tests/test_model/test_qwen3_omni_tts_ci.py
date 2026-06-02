@@ -34,7 +34,9 @@ from tests.test_model.omni_router_utils import (
     router_get_json,
 )
 from tests.utils import (
+    QWEN3_ASR_WER_CONCURRENCY,
     MetricCheckCollector,
+    apply_mos_slack,
     apply_slack,
     apply_wer_slack,
     assert_per_request_fields,
@@ -42,6 +44,7 @@ from tests.utils import (
     assert_summary_metrics,
     assert_wer_partitioned,
     no_proxy_env,
+    wait_for_gpu_memory_release,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -55,6 +58,7 @@ SIMILARITY_CHECKPOINT_ENV = "SEEDTTS_SIM_CHECKPOINT"
 
 WER_TIMEOUT = 600
 SIMILARITY_TIMEOUT = 600
+UTMOS_TIMEOUT = 600
 
 VC_WER_BELOW_50_CORPUS_MAX = 0.0142
 VC_WER_BELOW_50_CORPUS_THRESHOLD = apply_wer_slack(VC_WER_BELOW_50_CORPUS_MAX)
@@ -70,6 +74,10 @@ VC_N_ABOVE_50_MAX = 0
 # five with the standard slack margin. See the "Speaker similarity
 # calibration" section of the PR description for the per-run numbers.
 VC_SIMILARITY_MEAN_MIN = 60.0
+# Calibrated from worst-of-5 full generate+score runs on SeedTTS-50 EN, H200 SXM.
+# worst-of-5 = 4.1924 · mean = 4.2575 · stdev = 0.0487
+VC_UTMOS_MEAN_REFERENCE = 4.1924
+VC_UTMOS_MEAN_MIN = apply_mos_slack(VC_UTMOS_MEAN_REFERENCE)
 
 # Note (Chenyang): The thresholds for the throughput_qps of tests/test_model/test_qwen3_omni_tts_ci.py
 # are the most unstable metrics, so I drop it a lot.
@@ -123,51 +131,27 @@ def _run_benchmark(
 def _run_wer_transcribe(
     meta: str,
     output_dir: str,
+    *,
+    asr_router_port: int,
     lang: str = "en",
     device: str = "cuda:0",
 ) -> dict:
-    """Transcribe saved audio and compute WER in CI.
-
-    note (Chenyang): We invoke the benchmark as python -m
-    benchmarks.eval.benchmark_omni_seedtts rather than via a direct file
-    path so the benchmarks package is discovered via PEP 420 namespace
-    lookup from the project root (which PYTHONPATH guarantees below).
-    """
-    cmd = [
-        sys.executable,
-        "-m",
-        "benchmarks.eval.benchmark_omni_seedtts",
-        "--transcribe-only",
-        "--meta",
-        meta,
-        "--output-dir",
-        output_dir,
-        "--model",
-        "qwen3-omni",
-        "--lang",
-        lang,
-        "--device",
-        device,
-    ]
-
-    env = no_proxy_env()
-    existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = (
-        f"{PROJECT_ROOT}{os.pathsep}{existing}" if existing else str(PROJECT_ROOT)
+    """Transcribe saved audio and compute WER via Qwen3-ASR router."""
+    from benchmarks.eval.benchmark_omni_seedtts import (
+        OmniSeedttsBenchmarkConfig,
+        evaluate_generated_audio,
     )
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=WER_TIMEOUT,
-        env=env,
-        cwd=str(PROJECT_ROOT),
+    config = OmniSeedttsBenchmarkConfig(
+        model="qwen3-omni",
+        meta=meta,
+        output_dir=output_dir,
+        lang=lang,
+        device=device,
+        port=asr_router_port,
+        asr_concurrency=QWEN3_ASR_WER_CONCURRENCY,
     )
-    assert result.returncode == 0, (
-        f"WER transcribe failed (rc={result.returncode}).\n"
-        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
+    evaluate_generated_audio(config)
 
     results_path = Path(output_dir) / "wer_results.json"
     assert results_path.exists(), f"WER results file not found: {results_path}"
@@ -185,7 +169,7 @@ def _run_wer_transcribe(
     if summary.get("skipped", 0) > 0:
         print(
             f"\n[WER DIAGNOSTIC] {summary['skipped']}/{summary['total_samples']} "
-            f"samples skipped.\nSubprocess stderr:\n{result.stderr}"
+            "samples skipped."
         )
         for sample in wer_results["per_sample"]:
             if not sample.get("is_success", True):
@@ -276,6 +260,69 @@ def _assert_similarity_results(
         checks.assert_all()
 
 
+def _run_utmos(output_dir: str, *, device: str = "cuda:0") -> dict:
+    cmd = [
+        sys.executable,
+        "-m",
+        "benchmarks.eval.benchmark_omni_seedtts",
+        "--utmos-only",
+        "--meta",
+        DATASETS["seedtts-50"],
+        "--output-dir",
+        output_dir,
+        "--model",
+        "qwen3-omni",
+        "--device",
+        device,
+    ]
+    env = no_proxy_env()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        f"{PROJECT_ROOT}{os.pathsep}{existing}" if existing else str(PROJECT_ROOT)
+    )
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=UTMOS_TIMEOUT,
+        env=env,
+        cwd=str(PROJECT_ROOT),
+    )
+    assert result.returncode == 0, (
+        f"UTMOS eval failed (rc={result.returncode}).\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    results_path = Path(output_dir) / "utmos_results.json"
+    assert results_path.exists(), f"UTMOS results file not found: {results_path}"
+    with open(results_path) as f:
+        return json.load(f)
+
+
+def _assert_utmos_results(
+    results: dict,
+    threshold: float,
+    *,
+    collector: MetricCheckCollector | None = None,
+) -> None:
+    checks = collector or MetricCheckCollector("UTMOS")
+    summary = results.get("summary", {})
+    checks.check(bool(results.get("per_sample")), "per_sample must be non-empty")
+    checks.check(
+        summary.get("skipped", 0) == 0,
+        f"UTMOS: {summary.get('skipped')} skipped samples != 0",
+    )
+    mean = summary.get("utmos_mean")
+    if mean is None:
+        checks.fail("Missing utmos_mean in summary")
+    else:
+        checks.check(
+            mean >= threshold,
+            f"utmos_mean {mean:.4f} < threshold {threshold:.4f}",
+        )
+    if collector is None:
+        checks.assert_all()
+
+
 @pytest.fixture(scope="module")
 def dataset_repo() -> str:
     repo_id = DATASETS["seedtts-50"]
@@ -347,6 +394,7 @@ def wer_audio_dir(
 ) -> str:
     """Reuse speed-benchmark audio for WER after freeing the TTS server GPU."""
     qwen3_omni_router_server.stop()
+    wait_for_gpu_memory_release()
     generated_path = Path(speed_artifacts.output_dir) / "generated.json"
     assert generated_path.exists(), f"WER metadata missing: {generated_path}"
     return speed_artifacts.output_dir
@@ -408,13 +456,14 @@ def test_voice_cloning_non_streaming(
 
 @pytest.mark.benchmark
 def test_voice_cloning_wer(
-    qwen3_omni_router_server: ManagedRouterHandle,
     wer_audio_dir: str,
     dataset_repo: str,
+    qwen3_asr_wer_router: ManagedRouterHandle,
 ) -> None:
     results = _run_wer_transcribe(
         dataset_repo,
         wer_audio_dir,
+        asr_router_port=qwen3_asr_wer_router.port,
     )
     print_wer_summary(results["summary"], "qwen3-omni")
     checks = MetricCheckCollector("Qwen3-Omni voice-cloning WER")
@@ -425,7 +474,7 @@ def test_voice_cloning_wer(
         collector=checks,
     )
     checks.assert_all()
-    print_log_tail("router", qwen3_omni_router_server.log_file)
+    print_log_tail("asr_wer_router", qwen3_asr_wer_router.log_file)
 
 
 @pytest.mark.benchmark
@@ -471,6 +520,14 @@ def test_voice_cloning_similarity(
         summary.get("skipped", 0) == 0,
         f"speaker similarity: {summary.get('skipped')} skipped samples != 0",
     )
+    checks.assert_all()
+
+
+@pytest.mark.benchmark
+def test_voice_cloning_utmos(wer_audio_dir: str) -> None:
+    results = _run_utmos(wer_audio_dir)
+    checks = MetricCheckCollector("Qwen3-Omni voice-cloning UTMOS")
+    _assert_utmos_results(results, VC_UTMOS_MEAN_MIN, collector=checks)
     checks.assert_all()
 
 
