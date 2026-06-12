@@ -236,6 +236,7 @@ class TtsSeedttsBenchmarkConfig:
     stream: bool = False
     initial_codec_chunk_frames: int | None = None
     disable_tqdm: bool = False
+    server_extra_args: list[str] | None = None
     # Transcribe phase
     lang: str = "en"
     device: str = "cuda:0"
@@ -287,6 +288,7 @@ def _build_results_config(
         "concurrency": config.concurrency,
         "request_rate": config.request_rate,
         "initial_codec_chunk_frames": config.initial_codec_chunk_frames,
+        "server_extra_args": config.server_extra_args or [],
     }
 
 
@@ -412,12 +414,28 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
         stream=args.stream,
         initial_codec_chunk_frames=args.initial_codec_chunk_frames,
         disable_tqdm=args.disable_tqdm,
+        server_extra_args=_build_server_extra_args(args),
         lang=args.lang,
         device=args.device,
         similarity_checkpoint=args.similarity_checkpoint,
         asr_model_path=args.asr_model_path,
         asr_concurrency=args.asr_concurrency,
     )
+
+
+def _build_server_extra_args(args: argparse.Namespace) -> list[str]:
+    extra_args = list(args.server_extra_arg or [])
+    if args.tts_max_running_requests is not None:
+        extra_args.append(
+            "stages.2.factory_args.server_args_overrides.max_running_requests="
+            f"{args.tts_max_running_requests}"
+        )
+    if args.tts_cuda_graph_max_bs is not None:
+        extra_args.append(
+            "stages.2.factory_args.server_args_overrides.cuda_graph_max_bs="
+            f"{args.tts_cuda_graph_max_bs}"
+        )
+    return extra_args
 
 
 def _parse_token_count(value: str) -> int | str:
@@ -617,6 +635,34 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Timeout in seconds to wait for server readiness.",
     )
     parser.add_argument(
+        "--server-extra-arg",
+        action="append",
+        default=[],
+        help=(
+            "Extra argument passed to `sglang_omni.cli serve` when this "
+            "benchmark starts the TTS server. May be repeated. Example: "
+            "stages.2.factory_args.server_args_overrides.max_running_requests=32"
+        ),
+    )
+    parser.add_argument(
+        "--tts-max-running-requests",
+        type=int,
+        default=None,
+        help=(
+            "Convenience override for Higgs/TTS AR server "
+            "max_running_requests. Equivalent to a stages.2 server override."
+        ),
+    )
+    parser.add_argument(
+        "--tts-cuda-graph-max-bs",
+        type=int,
+        default=None,
+        help=(
+            "Convenience override for Higgs/TTS AR server cuda_graph_max_bs. "
+            "Equivalent to a stages.2 server override."
+        ),
+    )
+    parser.add_argument(
         "--skip-gpu-cleanup",
         action="store_true",
         help=(
@@ -707,6 +753,7 @@ def main() -> None:
             model_path=config.model,
             port=config.port,
             host=config.host,
+            extra_args=config.server_extra_args,
             log_file=Path(config.output_dir) / "server_logs" / "tts_server.log",
             timeout=args.server_timeout,
             wait_for_gpu_release=wait_for_gpu_release,

@@ -78,8 +78,9 @@ _REF_CODE_CACHE_MAX_BYTES = 256 * 1024 * 1024
 _REF_WAVEFORM_CACHE_MAX_ITEMS = 256
 _REF_WAVEFORM_CACHE_MAX_BYTES = 512 * 1024 * 1024
 
-# Saturates near c=16 on H100/H200; higher client concurrency only queues.
 DEFAULT_MAX_CONCURRENCY = 16
+DEFAULT_AR_SERVER_MAX_RUNNING_REQUESTS = 32
+DEFAULT_AR_SERVER_CUDA_GRAPH_MAX_BS = 32
 
 
 def _reference_audio_cache_key(reference_audio: Any) -> str | None:
@@ -342,9 +343,9 @@ def create_sglang_tts_engine_executor(
 
     overrides: dict[str, Any] = {
         "disable_cuda_graph": False,
-        "cuda_graph_max_bs": DEFAULT_MAX_CONCURRENCY,
+        "cuda_graph_max_bs": DEFAULT_AR_SERVER_CUDA_GRAPH_MAX_BS,
         "mem_fraction_static": 0.85,
-        "max_running_requests": DEFAULT_MAX_CONCURRENCY,
+        "max_running_requests": DEFAULT_AR_SERVER_MAX_RUNNING_REQUESTS,
         "chunked_prefill_size": 8192,
         "dtype": "bfloat16",
         # Radix cache is namespaced per ref-audio via Req.extra_key (set in
@@ -437,6 +438,8 @@ def create_vocoder_executor(
 
 __all__ = [
     "DEFAULT_MAX_CONCURRENCY",
+    "DEFAULT_AR_SERVER_CUDA_GRAPH_MAX_BS",
+    "DEFAULT_AR_SERVER_MAX_RUNNING_REQUESTS",
     "create_audio_encoder_executor",
     "create_preprocessing_executor",
     "create_sglang_tts_engine_executor",

@@ -26,6 +26,12 @@ def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
     stages_by_name = {stage.name: stage for stage in config.stages}
 
     assert stages_by_name["tts_engine"].stream_to == ["vocoder"]
+    assert (
+        stages_by_name["tts_engine"].factory_args["server_args_overrides"][
+            "max_running_requests"
+        ]
+        == stages.DEFAULT_AR_SERVER_MAX_RUNNING_REQUESTS
+    )
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
 
 
@@ -102,9 +108,13 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     assert captured["context_length"] == 4096
     assert captured["gpu_id"] == 0
     assert captured["overrides"]["disable_cuda_graph"] is False
-    assert captured["overrides"]["cuda_graph_max_bs"] == stages.DEFAULT_MAX_CONCURRENCY
     assert (
-        captured["overrides"]["max_running_requests"] == stages.DEFAULT_MAX_CONCURRENCY
+        captured["overrides"]["cuda_graph_max_bs"]
+        == stages.DEFAULT_AR_SERVER_CUDA_GRAPH_MAX_BS
+    )
+    assert (
+        captured["overrides"]["max_running_requests"]
+        == stages.DEFAULT_AR_SERVER_MAX_RUNNING_REQUESTS
     )
     assert captured["server_args"].disable_overlap_schedule is True
     assert captured["adapter_kwargs"] == {"max_new_tokens_cap": 2048}
