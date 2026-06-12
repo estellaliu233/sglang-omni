@@ -230,6 +230,7 @@ def managed_omni_server(
     model_path: str,
     port: int,
     host: str,
+    extra_args: list[str] | None = None,
     log_file: Path | None,
     timeout: int = STARTUP_TIMEOUT,
     wait_for_gpu_release: bool = True,
@@ -247,6 +248,8 @@ def managed_omni_server(
         "--host",
         host,
     ]
+    if extra_args:
+        cmd.extend(extra_args)
     logger.info(f"Starting server: {' '.join(cmd)}")
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)

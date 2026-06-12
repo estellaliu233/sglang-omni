@@ -6,7 +6,10 @@ from __future__ import annotations
 from typing import ClassVar
 
 from sglang_omni.config import PipelineConfig, StageConfig
-from sglang_omni.models.higgs_tts.stages import DEFAULT_MAX_CONCURRENCY
+from sglang_omni.models.higgs_tts.stages import (
+    DEFAULT_AR_SERVER_MAX_RUNNING_REQUESTS,
+    DEFAULT_MAX_CONCURRENCY,
+)
 
 _PKG = "sglang_omni.models.higgs_tts"
 
@@ -53,7 +56,7 @@ class HiggsTtsPipelineConfig(PipelineConfig):
                 "max_new_tokens": 2048,
                 "enable_async_decode": True,
                 "server_args_overrides": {
-                    "max_running_requests": DEFAULT_MAX_CONCURRENCY,
+                    "max_running_requests": DEFAULT_AR_SERVER_MAX_RUNNING_REQUESTS,
                 },
             },
             gpu=0,

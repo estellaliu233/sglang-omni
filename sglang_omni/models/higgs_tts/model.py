@@ -45,6 +45,15 @@ class HiggsGenParams:
 _DEFAULT_MAX_BATCH_SIZE = 64
 
 
+def _resolve_max_batch_size(configured_max_batch_size: int | None) -> int:
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        return int(get_global_server_args().max_running_requests)
+    except Exception:
+        return int(configured_max_batch_size or _DEFAULT_MAX_BATCH_SIZE)
+
+
 def _flat_sampling_attr(sampling_info, attr: str) -> list | None:
     """Return ``sampling_info.<attr>`` as a flat Python list, or ``None``.
 
@@ -141,7 +150,7 @@ class HiggsTTSModel(nn.Module):
                 self.multimodal_embedding.modality_embedding_0.weight
             )
 
-        self._max_batch_size = int(max_batch_size)
+        self._max_batch_size = _resolve_max_batch_size(max_batch_size)
         pool_size = self._max_batch_size + 1
         self._sampler_pool = HiggsBatchedSamplerState(
             max_batch_size=pool_size,
