@@ -229,8 +229,8 @@ def managed_omni_server(
     model_path: str,
     port: int,
     host: str,
-    extra_args: list[str] | None = None,
     log_file: Path | None,
+    extra_args: list[str] | None = None,
     timeout: int = STARTUP_TIMEOUT,
     wait_for_gpu_release: bool = True,
 ) -> Iterator[None]:

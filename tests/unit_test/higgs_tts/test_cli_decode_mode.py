@@ -11,7 +11,10 @@ from __future__ import annotations
 import pytest
 import typer
 
-from sglang_omni.cli.serve import apply_decode_mode_cli_overrides
+from sglang_omni.cli.serve import (
+    apply_decode_mode_cli_overrides,
+    apply_higgs_ar_batch_size_cli_override,
+)
 from sglang_omni.config import PipelineConfig, StageConfig, resolve_stage_factory_args
 from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
@@ -134,3 +137,41 @@ def test_async_lookahead_min_batch_size_without_tts_engine_fails_fast():
         apply_decode_mode_cli_overrides(
             config, decode_mode=None, async_lookahead_min_batch_size=4
         )
+
+
+def test_higgs_ar_batch_size_override_updates_server_args():
+    config = HiggsTtsPipelineConfig(model_path="dummy")
+    apply_higgs_ar_batch_size_cli_override(config, higgs_ar_max_batch_size=64)
+    args = _tts_engine_args(config)
+    assert args["server_args_overrides"]["max_running_requests"] == 64
+    assert args["server_args_overrides"]["cuda_graph_max_bs"] == 64
+
+
+def test_higgs_ar_batch_size_override_must_be_positive():
+    config = HiggsTtsPipelineConfig(model_path="dummy")
+    with pytest.raises(typer.BadParameter, match="must be >= 1"):
+        apply_higgs_ar_batch_size_cli_override(config, higgs_ar_max_batch_size=0)
+
+
+def test_higgs_ar_batch_size_override_rejects_unsupported_tts_engine():
+    config = Qwen3TTSPipelineConfig(model_path="dummy")
+    with pytest.raises(typer.BadParameter, match="currently supports only Higgs TTS"):
+        apply_higgs_ar_batch_size_cli_override(config, higgs_ar_max_batch_size=64)
+
+
+def test_higgs_ar_batch_size_absent_is_noop_without_tts_engine_stage():
+    config = PipelineConfig(
+        model_path="dummy",
+        stages=[
+            StageConfig(
+                name="thinker",
+                process="pipeline",
+                factory="tests.unit_test.fixtures.pipeline_fakes.dummy_factory",
+                terminal=True,
+            )
+        ],
+    )
+    result = apply_higgs_ar_batch_size_cli_override(
+        config, higgs_ar_max_batch_size=None
+    )
+    assert result is config
