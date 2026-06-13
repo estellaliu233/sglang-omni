@@ -435,12 +435,7 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
 def _build_higgs_ar_server_args(max_batch_size: int | None) -> list[str]:
     if max_batch_size is None:
         return []
-    return [
-        "stages.2.factory_args.server_args_overrides.max_running_requests="
-        f"{max_batch_size}",
-        "stages.2.factory_args.server_args_overrides.cuda_graph_max_bs="
-        f"{max_batch_size}",
-    ]
+    return ["--higgs-ar-max-batch-size", str(max_batch_size)]
 
 
 def _parse_token_count(value: str) -> int | str:
@@ -709,10 +704,7 @@ def main() -> None:
         and args.initial_codec_chunk_frames < 0
     ):
         parser.error("--initial-codec-chunk-frames must be non-negative")
-    if (
-        args.higgs_ar_max_batch_size is not None
-        and args.higgs_ar_max_batch_size <= 0
-    ):
+    if args.higgs_ar_max_batch_size is not None and args.higgs_ar_max_batch_size <= 0:
         parser.error("--higgs-ar-max-batch-size must be positive")
     if args.use_existing_server and not (args.generate_only or args.transcribe_only):
         parser.error(

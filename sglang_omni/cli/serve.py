@@ -21,6 +21,9 @@ _ASYNC_DECODE_FACTORIES = frozenset(
         "sglang_omni.models.moss_tts_local.stages.create_sglang_tts_engine_executor",
     }
 )
+_HIGGS_TTS_ENGINE_FACTORY = (
+    "sglang_omni.models.higgs_tts.stages.create_sglang_tts_engine_executor"
+)
 _QWEN_PARTIAL_START_TALKER_FACTORY = (
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config"
 )
@@ -139,6 +142,8 @@ def _apply_stage_server_args_override(
     stage_name: str,
     updates: dict[str, object],
     reason: str,
+    supported_factories: frozenset[str] | None = None,
+    flag_name: str | None = None,
 ) -> None:
     matching_stages = _find_matching_stages(
         pipeline_config,
@@ -146,6 +151,12 @@ def _apply_stage_server_args_override(
         reason=reason,
     )
     for stage in matching_stages:
+        if supported_factories is not None and stage.factory not in supported_factories:
+            display_flag = flag_name or reason
+            raise typer.BadParameter(
+                f"{display_flag} currently supports only Higgs TTS; "
+                f"stage {stage.name!r} uses factory {stage.factory!r}"
+            )
         factory_args = dict(stage.factory_args or {})
         overrides = dict(factory_args.get("server_args_overrides") or {})
         overrides.update(updates)
@@ -763,6 +774,30 @@ def apply_decode_mode_cli_overrides(
     return pipeline_config
 
 
+def apply_higgs_ar_batch_size_cli_override(
+    pipeline_config: PipelineConfig,
+    *,
+    higgs_ar_max_batch_size: int | None,
+) -> PipelineConfig:
+    if higgs_ar_max_batch_size is None:
+        return pipeline_config
+    if int(higgs_ar_max_batch_size) < 1:
+        raise typer.BadParameter("--higgs-ar-max-batch-size must be >= 1")
+    max_batch_size = int(higgs_ar_max_batch_size)
+    _apply_stage_server_args_override(
+        pipeline_config,
+        stage_name="tts_engine",
+        updates={
+            "max_running_requests": max_batch_size,
+            "cuda_graph_max_bs": max_batch_size,
+        },
+        reason="Higgs AR max batch size override",
+        supported_factories=frozenset({_HIGGS_TTS_ENGINE_FACTORY}),
+        flag_name="--higgs-ar-max-batch-size",
+    )
+    return pipeline_config
+
+
 def apply_torch_compile_cli_overrides(
     pipeline_config: PipelineConfig,
     *,
@@ -1044,6 +1079,17 @@ def serve(
             ),
         ),
     ] = None,
+    higgs_ar_max_batch_size: Annotated[
+        int | None,
+        typer.Option(
+            "--higgs-ar-max-batch-size",
+            "--higgs_ar_max_batch_size",
+            help=(
+                "Higgs TTS AR server batch size. Sets both max_running_requests "
+                "and cuda_graph_max_bs on the Higgs tts_engine stage."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Serve the pipeline."""
     logging.basicConfig(
@@ -1119,6 +1165,10 @@ def serve(
         merged_config,
         decode_mode=decode_mode,
         async_lookahead_min_batch_size=async_lookahead_min_batch_size,
+    )
+    merged_config = apply_higgs_ar_batch_size_cli_override(
+        merged_config,
+        higgs_ar_max_batch_size=higgs_ar_max_batch_size,
     )
     merged_config = apply_partial_start_cli_overrides(
         merged_config,
