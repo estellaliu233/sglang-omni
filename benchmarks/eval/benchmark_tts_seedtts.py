@@ -237,7 +237,7 @@ class TtsSeedttsBenchmarkConfig:
     stream_format: str = "sse"
     initial_codec_chunk_frames: int | None = None
     disable_tqdm: bool = False
-    server_extra_args: list[str] | None = None
+    higgs_ar_max_batch_size: int | None = None
     # Transcribe phase
     lang: str = "en"
     device: str = "cuda:0"
@@ -290,7 +290,7 @@ def _build_results_config(
         "request_rate": config.request_rate,
         "stream_format": config.stream_format if config.stream else None,
         "initial_codec_chunk_frames": config.initial_codec_chunk_frames,
-        "server_extra_args": config.server_extra_args or [],
+        "higgs_ar_max_batch_size": config.higgs_ar_max_batch_size,
     }
 
 
@@ -423,7 +423,7 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
         stream_format=args.stream_format,
         initial_codec_chunk_frames=args.initial_codec_chunk_frames,
         disable_tqdm=args.disable_tqdm,
-        server_extra_args=_build_server_extra_args(args),
+        higgs_ar_max_batch_size=args.higgs_ar_max_batch_size,
         lang=args.lang,
         device=args.device,
         similarity_checkpoint=args.similarity_checkpoint,
@@ -432,19 +432,15 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
     )
 
 
-def _build_server_extra_args(args: argparse.Namespace) -> list[str]:
-    extra_args = list(args.server_extra_arg or [])
-    if args.tts_max_running_requests is not None:
-        extra_args.append(
-            "stages.2.factory_args.server_args_overrides.max_running_requests="
-            f"{args.tts_max_running_requests}"
-        )
-    if args.tts_cuda_graph_max_bs is not None:
-        extra_args.append(
-            "stages.2.factory_args.server_args_overrides.cuda_graph_max_bs="
-            f"{args.tts_cuda_graph_max_bs}"
-        )
-    return extra_args
+def _build_higgs_ar_server_args(max_batch_size: int | None) -> list[str]:
+    if max_batch_size is None:
+        return []
+    return [
+        "stages.2.factory_args.server_args_overrides.max_running_requests="
+        f"{max_batch_size}",
+        "stages.2.factory_args.server_args_overrides.cuda_graph_max_bs="
+        f"{max_batch_size}",
+    ]
 
 
 def _parse_token_count(value: str) -> int | str:
@@ -653,31 +649,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Timeout in seconds to wait for server readiness.",
     )
     parser.add_argument(
-        "--server-extra-arg",
-        action="append",
-        default=[],
-        help=(
-            "Extra argument passed to `sglang_omni.cli serve` when this "
-            "benchmark starts the TTS server. May be repeated. Example: "
-            "stages.2.factory_args.server_args_overrides.max_running_requests=32"
-        ),
-    )
-    parser.add_argument(
-        "--tts-max-running-requests",
+        "--higgs-ar-max-batch-size",
         type=int,
         default=None,
         help=(
-            "Convenience override for Higgs/TTS AR server "
-            "max_running_requests. Equivalent to a stages.2 server override."
-        ),
-    )
-    parser.add_argument(
-        "--tts-cuda-graph-max-bs",
-        type=int,
-        default=None,
-        help=(
-            "Convenience override for Higgs/TTS AR server cuda_graph_max_bs. "
-            "Equivalent to a stages.2 server override."
+            "Higgs AR server batch size override. Sets both max_running_requests "
+            "and cuda_graph_max_bs for the tts_engine stage."
         ),
     )
     parser.add_argument(
@@ -732,6 +709,11 @@ def main() -> None:
         and args.initial_codec_chunk_frames < 0
     ):
         parser.error("--initial-codec-chunk-frames must be non-negative")
+    if (
+        args.higgs_ar_max_batch_size is not None
+        and args.higgs_ar_max_batch_size <= 0
+    ):
+        parser.error("--higgs-ar-max-batch-size must be positive")
     if args.use_existing_server and not (args.generate_only or args.transcribe_only):
         parser.error(
             "--use-existing-server currently requires --generate-only or "
@@ -773,7 +755,7 @@ def main() -> None:
             model_path=config.model,
             port=config.port,
             host=config.host,
-            extra_args=config.server_extra_args,
+            extra_args=_build_higgs_ar_server_args(config.higgs_ar_max_batch_size),
             log_file=Path(config.output_dir) / "server_logs" / "tts_server.log",
             timeout=args.server_timeout,
             wait_for_gpu_release=wait_for_gpu_release,
