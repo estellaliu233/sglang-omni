@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import collections
 import threading
 import time
 from dataclasses import dataclass, field
@@ -24,6 +23,7 @@ from sglang_omni.models.moss_tts.request_builders import (
     resolve_moss_reference,
 )
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
+from sglang_omni.models.tts_streaming import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.types import ARRequestData
 
@@ -38,6 +38,9 @@ class MossTTSLocalSGLangRequestData(ARRequestData):
     req: Any = None
     synced: bool = False
     generation_steps: int = 0
+    # Launch-side seeded-sampling step counter (async decode): advances at launch
+    # while generation_steps moves at resolve. Floored so the sync path is unchanged.
+    sampling_steps: int | None = None
     suppress_tokens: list[int] | None = None
     input_embeds_are_projected: bool = False
     stage_payload: Any = None
@@ -45,7 +48,6 @@ class MossTTSLocalSGLangRequestData(ARRequestData):
     model_config: Any = None
     prompt_rows: torch.Tensor | None = None
     output_rows: list[torch.Tensor] = field(default_factory=list)
-    pending_feedback_queue: Any = field(default_factory=collections.deque)
     # Checkpoint generate() defaults: the binary continue/stop head samples at
     # plain temperature 1.0 while the audio channels use the model-card
     # recommendation (1.7 / 0.8 / 25, repetition penalty off).
@@ -59,6 +61,8 @@ class MossTTSLocalSGLangRequestData(ARRequestData):
     seed: int | None = None
     sampling_seed: int = field(default_factory=_new_moss_tts_sampling_seed)
     engine_start_s: float = 0.0
+    # Non-None marks a streaming request.
+    stream_metadata: dict[str, Any] | None = None
 
 
 @dataclass
@@ -335,6 +339,27 @@ def preprocess_moss_tts_local_payload(payload: StagePayload) -> StagePayload:
     )
 
 
+def build_moss_tts_local_stream_metadata(
+    payload: StagePayload,
+    *,
+    n_vq: int,
+) -> dict[str, Any] | None:
+    """Stream contract attached to every forwarded row of a streaming request."""
+    params = payload.request.params if isinstance(payload.request.params, dict) else {}
+    if not params.get("stream"):
+        return None
+    metadata: dict[str, Any] = {
+        "stream": True,
+        "modality": "audio_codes",
+        "n_vq": int(n_vq),
+    }
+    if params.get(INITIAL_CODEC_CHUNK_FRAMES_PARAM) is not None:
+        metadata[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = params[
+            INITIAL_CODEC_CHUNK_FRAMES_PARAM
+        ]
+    return metadata
+
+
 def build_sglang_moss_tts_local_request(
     payload: StagePayload,
     *,
@@ -399,6 +424,9 @@ def build_sglang_moss_tts_local_request(
             else _new_moss_tts_sampling_seed()
         ),
         engine_start_s=time.perf_counter(),
+        stream_metadata=build_moss_tts_local_stream_metadata(
+            payload, n_vq=int(prepared.prompt_rows.shape[1]) - 1
+        ),
     )
     data.input_embeds_are_projected = True
     data.stage_payload = payload
@@ -438,6 +466,11 @@ def make_moss_tts_local_scheduler_adapters(*, model: Any):
         return build_sglang_moss_tts_local_request(payload, model=model)
 
     def result_adapter(data: MossTTSLocalSGLangRequestData) -> StagePayload:
-        return apply_sglang_moss_tts_local_result(data.stage_payload, data)
+        try:
+            return apply_sglang_moss_tts_local_result(data.stage_payload, data)
+        finally:
+            # Release the finished request's decode-state pool row (mirrors
+            # Higgs request_builders.py:186); recycles the row for a waiter.
+            model.reset_request(data.stage_payload.request_id)
 
     return request_builder, result_adapter
