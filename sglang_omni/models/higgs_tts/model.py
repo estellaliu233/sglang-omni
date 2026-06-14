@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Iterable, Tuple
 
@@ -24,6 +25,8 @@ from sglang_omni.models.higgs_tts.sampler import (
 )
 from sglang_omni.models.higgs_tts.weight_loader import DiscreteWeightMapper
 
+logger = logging.getLogger(__name__)
+
 # Higgs ckpt prefixes → sglang Qwen3ForCausalLM parameter tree (under ``backbone.``).
 _BACKBONE_PREFIX_MAP: dict[str, str] = {
     "tied.embedding.text_embedding.": "backbone.model.embed_tokens.",
@@ -42,16 +45,20 @@ class HiggsGenParams:
     top_k: int | None = None
 
 
-_DEFAULT_MAX_BATCH_SIZE = 64
-
-
 def _resolve_max_batch_size(configured_max_batch_size: int | None) -> int:
     try:
         from sglang.srt.server_args import get_global_server_args
 
         return int(get_global_server_args().max_running_requests)
-    except Exception:
-        return int(configured_max_batch_size or _DEFAULT_MAX_BATCH_SIZE)
+    except (ImportError, AttributeError, TypeError, ValueError) as exc:
+        fallback = int(configured_max_batch_size or 64)
+        logger.warning(
+            "Falling back to configured Higgs max_batch_size=%s because SGLang "
+            "global server args are unavailable: %s",
+            fallback,
+            exc,
+        )
+        return fallback
 
 
 def _flat_sampling_attr(sampling_info, attr: str) -> list | None:
@@ -103,7 +110,7 @@ class HiggsTTSModel(nn.Module):
         config: HiggsMultimodalQwen3Config,
         quant_config=None,
         prefix: str = "",
-        max_batch_size: int = _DEFAULT_MAX_BATCH_SIZE,
+        max_batch_size: int = 64,
     ) -> None:
         super().__init__()
         self.config = config

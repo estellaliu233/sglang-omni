@@ -795,26 +795,34 @@ def apply_decode_mode_cli_overrides(
     return pipeline_config
 
 
-def apply_higgs_ar_batch_size_cli_override(
+def apply_higgs_ar_server_args_cli_override(
     pipeline_config: PipelineConfig,
     *,
-    higgs_ar_max_batch_size: int | None,
+    max_running_requests: int | None,
+    cuda_graph_max_bs: int | None,
 ) -> PipelineConfig:
-    if higgs_ar_max_batch_size is None:
+    if max_running_requests is None and cuda_graph_max_bs is None:
         return pipeline_config
-    if int(higgs_ar_max_batch_size) < 1:
-        raise typer.BadParameter("--higgs-ar-max-batch-size must be >= 1")
-    max_batch_size = int(higgs_ar_max_batch_size)
+    if max_running_requests is None:
+        max_running_requests = cuda_graph_max_bs
+    elif cuda_graph_max_bs is None:
+        cuda_graph_max_bs = max_running_requests
+    if max_running_requests is None or cuda_graph_max_bs is None:
+        return pipeline_config
+    if int(max_running_requests) < 1:
+        raise typer.BadParameter("--max-running-requests must be >= 1")
+    if int(cuda_graph_max_bs) < 1:
+        raise typer.BadParameter("--cuda-graph-max-bs must be >= 1")
     _apply_stage_server_args_override(
         pipeline_config,
         stage_name="tts_engine",
         updates={
-            "max_running_requests": max_batch_size,
-            "cuda_graph_max_bs": max_batch_size,
+            "max_running_requests": int(max_running_requests),
+            "cuda_graph_max_bs": int(cuda_graph_max_bs),
         },
-        reason="Higgs AR max batch size override",
+        reason="Higgs AR server args override",
         supported_factories=frozenset({_HIGGS_TTS_ENGINE_FACTORY}),
-        flag_name="--higgs-ar-max-batch-size",
+        flag_name="--max-running-requests/--cuda-graph-max-bs",
     )
     return pipeline_config
 
@@ -1123,14 +1131,29 @@ def serve(
             ),
         ),
     ] = None,
-    higgs_ar_max_batch_size: Annotated[
+    max_running_requests: Annotated[
         int | None,
         typer.Option(
-            "--higgs-ar-max-batch-size",
-            "--higgs_ar_max_batch_size",
+            "--max-running-requests",
+            "--max_running_requests",
             help=(
-                "Higgs TTS AR server batch size. Sets both max_running_requests "
-                "and cuda_graph_max_bs on the Higgs tts_engine stage."
+                "Higgs TTS AR server max_running_requests override for the "
+                "tts_engine stage. Recommended to keep equal to "
+                "--cuda-graph-max-bs; if only one is set, the other is filled "
+                "with the same value."
+            ),
+        ),
+    ] = None,
+    cuda_graph_max_bs: Annotated[
+        int | None,
+        typer.Option(
+            "--cuda-graph-max-bs",
+            "--cuda_graph_max_bs",
+            help=(
+                "Higgs TTS AR server cuda_graph_max_bs override for the "
+                "tts_engine stage. Recommended to keep equal to "
+                "--max-running-requests; if only one is set, the other is "
+                "filled with the same value."
             ),
         ),
     ] = None,
@@ -1210,9 +1233,10 @@ def serve(
         decode_mode=decode_mode,
         async_lookahead_min_batch_size=async_lookahead_min_batch_size,
     )
-    merged_config = apply_higgs_ar_batch_size_cli_override(
+    merged_config = apply_higgs_ar_server_args_cli_override(
         merged_config,
-        higgs_ar_max_batch_size=higgs_ar_max_batch_size,
+        max_running_requests=max_running_requests,
+        cuda_graph_max_bs=cuda_graph_max_bs,
     )
     merged_config = apply_partial_start_cli_overrides(
         merged_config,
