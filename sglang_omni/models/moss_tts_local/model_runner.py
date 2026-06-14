@@ -638,13 +638,12 @@ class MossTTSLocalModelRunner(ModelRunner):
                 continue
             sched_req.data.output_rows.append(journal.rows[i])
             stream_metadata = getattr(sched_req.data, "stream_metadata", None)
-            outbox = getattr(self, "_outbox", None)
-            if outbox is None or stream_metadata is None:
+            if self._outbox is None or stream_metadata is None:
                 continue
             if rows_cpu is None:
                 # One D2H per step regardless of how many requests stream.
                 rows_cpu = journal.rows.detach().to("cpu", torch.long)
-            outbox.put(
+            self._outbox.put(
                 OutgoingMessage(
                     request_id=sched_req.request_id,
                     type="stream",
