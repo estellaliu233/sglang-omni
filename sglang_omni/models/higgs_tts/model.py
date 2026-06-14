@@ -45,18 +45,16 @@ class HiggsGenParams:
     top_k: int | None = None
 
 
-def _resolve_max_batch_size(configured_max_batch_size: int | None) -> int:
+def _resolve_max_running_requests() -> int:
     try:
         from sglang.srt.server_args import get_global_server_args
 
         return int(get_global_server_args().max_running_requests)
     except (ImportError, AttributeError, TypeError, ValueError) as exc:
-        fallback = int(configured_max_batch_size or 64)
+        fallback = 64
         logger.warning(
-            "Falling back to configured Higgs max_batch_size=%s because SGLang "
-            "global server args are unavailable: %s",
-            fallback,
-            exc,
+            f"Falling back to Higgs max_running_requests={fallback} because "
+            f"SGLang global server args are unavailable: {exc}"
         )
         return fallback
 
@@ -110,7 +108,6 @@ class HiggsTTSModel(nn.Module):
         config: HiggsMultimodalQwen3Config,
         quant_config=None,
         prefix: str = "",
-        max_batch_size: int = 64,
     ) -> None:
         super().__init__()
         self.config = config
@@ -157,7 +154,7 @@ class HiggsTTSModel(nn.Module):
                 self.multimodal_embedding.modality_embedding_0.weight
             )
 
-        self._max_batch_size = _resolve_max_batch_size(max_batch_size)
+        self._max_batch_size = _resolve_max_running_requests()
         pool_size = self._max_batch_size + 1
         self._sampler_pool = HiggsBatchedSamplerState(
             max_batch_size=pool_size,
@@ -229,9 +226,9 @@ class HiggsTTSModel(nn.Module):
             return row
         if not self._free_rows:
             raise RuntimeError(
-                f"HiggsTTSModel sampler pool exhausted (max_batch_size="
-                f"{self._max_batch_size}); raise ``max_batch_size`` or limit "
-                f"concurrent requests."
+                f"HiggsTTSModel sampler pool exhausted "
+                f"(max_running_requests={self._max_batch_size}); raise "
+                f"``max_running_requests`` or limit concurrent requests."
             )
         row = self._free_rows.pop()
         self._rid_to_row[req_id] = row

@@ -230,7 +230,8 @@ def managed_omni_server(
     port: int,
     host: str,
     log_file: Path | None,
-    extra_args: list[str] | None = None,
+    max_running_requests: int | None = None,
+    cuda_graph_max_bs: int | None = None,
     timeout: int = STARTUP_TIMEOUT,
     wait_for_gpu_release: bool = True,
 ) -> Iterator[None]:
@@ -247,8 +248,10 @@ def managed_omni_server(
         "--host",
         host,
     ]
-    if extra_args:
-        cmd.extend(extra_args)
+    if max_running_requests is not None:
+        cmd.extend(["--max-running-requests", str(max_running_requests)])
+    if cuda_graph_max_bs is not None:
+        cmd.extend(["--cuda-graph-max-bs", str(cuda_graph_max_bs)])
     logger.info(f"Starting server: {' '.join(cmd)}")
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)

@@ -252,8 +252,6 @@ def create_audio_encoder_executor(
     device: str = "cuda:0",
     dtype: str = "bfloat16",
     num_codebooks: int = 8,
-    max_batch_size: int = 16,
-    max_batch_wait_ms: int = 2,
 ):
     """GPU stage: codec-encode raw ref audio → delayed codes + prompt assembly.
 
@@ -317,11 +315,7 @@ def create_audio_encoder_executor(
         payload.data = state.to_dict()
         return payload
 
-    return SimpleScheduler(
-        _encode,
-        max_batch_size=max_batch_size,
-        max_batch_wait_ms=max_batch_wait_ms,
-    )
+    return SimpleScheduler(_encode)
 
 
 def create_sglang_tts_engine_executor(
@@ -409,7 +403,7 @@ def create_vocoder_executor(
     *,
     device: str = "cuda:0",
     dtype: str = "bfloat16",
-    max_batch_size: int = 16,
+    vocoder_decode_batch_size: int = 16,
     max_batch_wait_ms: int = 2,
     stream_stride: int = 75,
     stream_followup_stride: int = 75,
@@ -425,7 +419,7 @@ def create_vocoder_executor(
 
     return HiggsStreamingVocoderScheduler(
         codec,
-        max_batch_size=max_batch_size,
+        max_batch_size=vocoder_decode_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
         stream_stride=stream_stride,
         stream_followup_stride=stream_followup_stride,

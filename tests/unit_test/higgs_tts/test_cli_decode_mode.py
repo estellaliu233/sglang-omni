@@ -13,16 +13,21 @@ import typer
 
 from sglang_omni.cli.serve import (
     apply_decode_mode_cli_overrides,
-    apply_higgs_ar_server_args_cli_override,
+    apply_generation_server_args_cli_override,
 )
 from sglang_omni.config import PipelineConfig, StageConfig, resolve_stage_factory_args
 from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
+from sglang_omni.models.qwen3_omni.config import Qwen3OmniSpeechPipelineConfig
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
 
 
-def _tts_engine_args(config: PipelineConfig) -> dict[str, object]:
-    stage = next(s for s in config.stages if s.name == "tts_engine")
+def _stage_args(config: PipelineConfig, stage_name: str) -> dict[str, object]:
+    stage = next(s for s in config.stages if s.name == stage_name)
     return resolve_stage_factory_args(stage, config)
+
+
+def _tts_engine_args(config: PipelineConfig) -> dict[str, object]:
+    return _stage_args(config, "tts_engine")
 
 
 def test_decode_mode_default_config_is_async():
@@ -139,9 +144,9 @@ def test_async_lookahead_min_batch_size_without_tts_engine_fails_fast():
         )
 
 
-def test_higgs_ar_server_args_override_updates_server_args():
+def test_generation_server_args_override_updates_server_args():
     config = HiggsTtsPipelineConfig(model_path="dummy")
-    apply_higgs_ar_server_args_cli_override(
+    apply_generation_server_args_cli_override(
         config,
         max_running_requests=64,
         cuda_graph_max_bs=128,
@@ -151,9 +156,9 @@ def test_higgs_ar_server_args_override_updates_server_args():
     assert args["server_args_overrides"]["cuda_graph_max_bs"] == 128
 
 
-def test_higgs_ar_server_args_fill_in_max_running_requests():
+def test_generation_server_args_fill_in_max_running_requests():
     config = HiggsTtsPipelineConfig(model_path="dummy")
-    apply_higgs_ar_server_args_cli_override(
+    apply_generation_server_args_cli_override(
         config,
         max_running_requests=None,
         cuda_graph_max_bs=128,
@@ -163,9 +168,9 @@ def test_higgs_ar_server_args_fill_in_max_running_requests():
     assert args["server_args_overrides"]["cuda_graph_max_bs"] == 128
 
 
-def test_higgs_ar_server_args_fill_in_cuda_graph_max_bs():
+def test_generation_server_args_fill_in_cuda_graph_max_bs():
     config = HiggsTtsPipelineConfig(model_path="dummy")
-    apply_higgs_ar_server_args_cli_override(
+    apply_generation_server_args_cli_override(
         config,
         max_running_requests=128,
         cuda_graph_max_bs=None,
@@ -175,33 +180,47 @@ def test_higgs_ar_server_args_fill_in_cuda_graph_max_bs():
     assert args["server_args_overrides"]["cuda_graph_max_bs"] == 128
 
 
-def test_higgs_ar_server_args_override_must_be_positive():
+def test_generation_server_args_override_must_be_positive():
     config = HiggsTtsPipelineConfig(model_path="dummy")
     with pytest.raises(typer.BadParameter, match="--max-running-requests"):
-        apply_higgs_ar_server_args_cli_override(
+        apply_generation_server_args_cli_override(
             config,
             max_running_requests=0,
             cuda_graph_max_bs=None,
         )
     with pytest.raises(typer.BadParameter, match="must be >= 1"):
-        apply_higgs_ar_server_args_cli_override(
+        apply_generation_server_args_cli_override(
             config,
             max_running_requests=None,
             cuda_graph_max_bs=0,
         )
 
 
-def test_higgs_ar_server_args_override_rejects_unsupported_tts_engine():
+def test_generation_server_args_override_supports_qwen3_tts_engine():
     config = Qwen3TTSPipelineConfig(model_path="dummy")
-    with pytest.raises(typer.BadParameter, match="currently supports only Higgs TTS"):
-        apply_higgs_ar_server_args_cli_override(
-            config,
-            max_running_requests=64,
-            cuda_graph_max_bs=64,
-        )
+    apply_generation_server_args_cli_override(
+        config,
+        max_running_requests=64,
+        cuda_graph_max_bs=64,
+    )
+    args = _tts_engine_args(config)
+    assert args["server_args_overrides"]["max_running_requests"] == 64
+    assert args["server_args_overrides"]["cuda_graph_max_bs"] == 64
 
 
-def test_higgs_ar_server_args_absent_is_noop_without_tts_engine_stage():
+def test_generation_server_args_override_supports_qwen3_omni_talker():
+    config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
+    apply_generation_server_args_cli_override(
+        config,
+        max_running_requests=64,
+        cuda_graph_max_bs=64,
+    )
+    args = _stage_args(config, "talker_ar")
+    assert args["server_args_overrides"]["max_running_requests"] == 64
+    assert args["server_args_overrides"]["cuda_graph_max_bs"] == 64
+
+
+def test_generation_server_args_absent_is_noop_without_generation_stage():
     config = PipelineConfig(
         model_path="dummy",
         stages=[
@@ -213,9 +232,29 @@ def test_higgs_ar_server_args_absent_is_noop_without_tts_engine_stage():
             )
         ],
     )
-    result = apply_higgs_ar_server_args_cli_override(
+    result = apply_generation_server_args_cli_override(
         config,
         max_running_requests=None,
         cuda_graph_max_bs=None,
     )
     assert result is config
+
+
+def test_generation_server_args_override_without_generation_stage_fails_fast():
+    config = PipelineConfig(
+        model_path="dummy",
+        stages=[
+            StageConfig(
+                name="preprocessing",
+                process="pipeline",
+                factory="tests.unit_test.fixtures.pipeline_fakes.dummy_factory",
+                terminal=True,
+            )
+        ],
+    )
+    with pytest.raises(typer.BadParameter, match="--max-running-requests"):
+        apply_generation_server_args_cli_override(
+            config,
+            max_running_requests=64,
+            cuda_graph_max_bs=64,
+        )

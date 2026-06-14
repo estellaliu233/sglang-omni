@@ -630,7 +630,7 @@ def test_higgs_tts_vocoder_batches_decode_requests(
     decode_batch_sizes = _fake_codec_fixtures(monkeypatch)
 
     scheduler = stages.create_vocoder_executor(
-        "fake-model", max_batch_size=4, max_batch_wait_ms=2
+        "fake-model", vocoder_decode_batch_size=4, max_batch_wait_ms=2
     )
 
     p1 = _make_payload(
@@ -665,7 +665,9 @@ def test_higgs_tts_vocoder_batch_handles_empty_items(
     """Items with empty/too-short codes get empty waveform payloads, not a crash."""
     decode_batch_sizes = _fake_codec_fixtures(monkeypatch)
 
-    scheduler = stages.create_vocoder_executor("fake-model", max_batch_size=4)
+    scheduler = stages.create_vocoder_executor(
+        "fake-model", vocoder_decode_batch_size=4
+    )
 
     payloads = [
         _make_payload("r-empty", HiggsTtsState(output_codes_delayed=None)),

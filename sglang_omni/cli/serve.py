@@ -24,9 +24,6 @@ _ASYNC_DECODE_FACTORIES = frozenset(
         "sglang_omni.models.moss_tts_local.stages.create_sglang_tts_engine_executor",
     }
 )
-_HIGGS_TTS_ENGINE_FACTORY = (
-    "sglang_omni.models.higgs_tts.stages.create_sglang_tts_engine_executor"
-)
 _QWEN_PARTIAL_START_TALKER_FACTORY = (
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config"
 )
@@ -139,6 +136,19 @@ def _resolve_talker_sglang_stage(
     return stage_name
 
 
+def _resolve_generation_sglang_stage(
+    pipeline_config: PipelineConfig,
+    *,
+    flag_name: str,
+) -> str:
+    stage_name = type(pipeline_config).talker_sglang_role_to_stage().get("talker")
+    if stage_name is not None:
+        return stage_name
+    if any(stage.name == "tts_engine" for stage in pipeline_config.stages):
+        return "tts_engine"
+    _raise_unsupported_flag(pipeline_config, flag_name)
+
+
 def _apply_stage_server_args_override(
     pipeline_config: PipelineConfig,
     *,
@@ -157,8 +167,8 @@ def _apply_stage_server_args_override(
         if supported_factories is not None and stage.factory not in supported_factories:
             display_flag = flag_name or reason
             raise typer.BadParameter(
-                f"{display_flag} currently supports only Higgs TTS; "
-                f"stage {stage.name!r} uses factory {stage.factory!r}"
+                f"{display_flag} does not support stage {stage.name!r} "
+                f"with factory {stage.factory!r}"
             )
         factory_args = dict(stage.factory_args or {})
         overrides = dict(factory_args.get("server_args_overrides") or {})
@@ -795,7 +805,7 @@ def apply_decode_mode_cli_overrides(
     return pipeline_config
 
 
-def apply_higgs_ar_server_args_cli_override(
+def apply_generation_server_args_cli_override(
     pipeline_config: PipelineConfig,
     *,
     max_running_requests: int | None,
@@ -813,16 +823,18 @@ def apply_higgs_ar_server_args_cli_override(
         raise typer.BadParameter("--max-running-requests must be >= 1")
     if int(cuda_graph_max_bs) < 1:
         raise typer.BadParameter("--cuda-graph-max-bs must be >= 1")
+    stage_name = _resolve_generation_sglang_stage(
+        pipeline_config,
+        flag_name="--max-running-requests/--cuda-graph-max-bs",
+    )
     _apply_stage_server_args_override(
         pipeline_config,
-        stage_name="tts_engine",
+        stage_name=stage_name,
         updates={
             "max_running_requests": int(max_running_requests),
             "cuda_graph_max_bs": int(cuda_graph_max_bs),
         },
-        reason="Higgs AR server args override",
-        supported_factories=frozenset({_HIGGS_TTS_ENGINE_FACTORY}),
-        flag_name="--max-running-requests/--cuda-graph-max-bs",
+        reason="SGLang generation server args override",
     )
     return pipeline_config
 
@@ -1137,10 +1149,9 @@ def serve(
             "--max-running-requests",
             "--max_running_requests",
             help=(
-                "Higgs TTS AR server max_running_requests override for the "
-                "tts_engine stage. Recommended to keep equal to "
-                "--cuda-graph-max-bs; if only one is set, the other is filled "
-                "with the same value."
+                "SGLang generation stage max_running_requests override. "
+                "Recommended to keep equal to --cuda-graph-max-bs; if only "
+                "one is set, the other is filled with the same value."
             ),
         ),
     ] = None,
@@ -1150,10 +1161,9 @@ def serve(
             "--cuda-graph-max-bs",
             "--cuda_graph_max_bs",
             help=(
-                "Higgs TTS AR server cuda_graph_max_bs override for the "
-                "tts_engine stage. Recommended to keep equal to "
-                "--max-running-requests; if only one is set, the other is "
-                "filled with the same value."
+                "SGLang generation stage cuda_graph_max_bs override. "
+                "Recommended to keep equal to --max-running-requests; if "
+                "only one is set, the other is filled with the same value."
             ),
         ),
     ] = None,
@@ -1233,7 +1243,7 @@ def serve(
         decode_mode=decode_mode,
         async_lookahead_min_batch_size=async_lookahead_min_batch_size,
     )
-    merged_config = apply_higgs_ar_server_args_cli_override(
+    merged_config = apply_generation_server_args_cli_override(
         merged_config,
         max_running_requests=max_running_requests,
         cuda_graph_max_bs=cuda_graph_max_bs,

@@ -426,18 +426,6 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
     )
 
 
-def _build_higgs_ar_server_args(
-    max_running_requests: int | None,
-    cuda_graph_max_bs: int | None,
-) -> list[str]:
-    args: list[str] = []
-    if max_running_requests is not None:
-        args.extend(["--max-running-requests", str(max_running_requests)])
-    if cuda_graph_max_bs is not None:
-        args.extend(["--cuda-graph-max-bs", str(cuda_graph_max_bs)])
-    return args
-
-
 def _parse_token_count(value: str) -> int | str:
     normalized = value.strip().lower()
     if normalized == MOSS_TTS_TOKEN_COUNT_AUTO:
@@ -639,8 +627,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Higgs AR server max_running_requests override for the tts_engine "
-            "stage. Recommended to keep equal to --cuda-graph-max-bs."
+            "SGLang generation stage max_running_requests override for the "
+            "server started by this benchmark. Recommended to keep equal to "
+            "--cuda-graph-max-bs."
         ),
     )
     parser.add_argument(
@@ -648,8 +637,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Higgs AR server cuda_graph_max_bs override for the tts_engine "
-            "stage. Recommended to keep equal to --max-running-requests."
+            "SGLang generation stage cuda_graph_max_bs override for the "
+            "server started by this benchmark. Recommended to keep equal to "
+            "--max-running-requests."
         ),
     )
     parser.add_argument(
@@ -747,10 +737,8 @@ def main() -> None:
             model_path=config.model,
             port=config.port,
             host=config.host,
-            extra_args=_build_higgs_ar_server_args(
-                config.max_running_requests,
-                config.cuda_graph_max_bs,
-            ),
+            max_running_requests=config.max_running_requests,
+            cuda_graph_max_bs=config.cuda_graph_max_bs,
             log_file=Path(config.output_dir) / "server_logs" / "tts_server.log",
             timeout=args.server_timeout,
             wait_for_gpu_release=wait_for_gpu_release,
