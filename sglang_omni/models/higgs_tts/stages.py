@@ -78,10 +78,6 @@ _REF_CODE_CACHE_MAX_BYTES = 256 * 1024 * 1024
 _REF_WAVEFORM_CACHE_MAX_ITEMS = 256
 _REF_WAVEFORM_CACHE_MAX_BYTES = 512 * 1024 * 1024
 
-DEFAULT_MAX_CONCURRENCY = 16
-DEFAULT_AR_SERVER_MAX_RUNNING_REQUESTS = 32
-DEFAULT_AR_SERVER_CUDA_GRAPH_MAX_BS = 32
-
 
 def _reference_audio_cache_key(reference_audio: Any) -> str | None:
     """Safe source key for preprocessing waveform-cache lookup."""
@@ -122,7 +118,7 @@ def create_preprocessing_executor(
     *,
     num_codebooks: int = 8,
     codebook_size: int = 1026,
-    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+    max_concurrency: int = 16,
 ):
     """CPU stage: text tokenize + optional ref-audio file IO.
 
@@ -256,7 +252,7 @@ def create_audio_encoder_executor(
     device: str = "cuda:0",
     dtype: str = "bfloat16",
     num_codebooks: int = 8,
-    max_batch_size: int = DEFAULT_MAX_CONCURRENCY,
+    max_batch_size: int = 16,
     max_batch_wait_ms: int = 2,
 ):
     """GPU stage: codec-encode raw ref audio → delayed codes + prompt assembly.
@@ -333,6 +329,8 @@ def create_sglang_tts_engine_executor(
     *,
     device: str = "cuda:0",
     max_new_tokens: int | None = 2048,
+    max_running_requests: int = 64,
+    cuda_graph_max_bs: int = 64,
     server_args_overrides: dict[str, Any] | None = None,
     enable_async_decode: bool = False,
     async_decode_min_batch_size: int = 2,
@@ -343,9 +341,9 @@ def create_sglang_tts_engine_executor(
 
     overrides: dict[str, Any] = {
         "disable_cuda_graph": False,
-        "cuda_graph_max_bs": DEFAULT_AR_SERVER_CUDA_GRAPH_MAX_BS,
+        "cuda_graph_max_bs": cuda_graph_max_bs,
         "mem_fraction_static": 0.85,
-        "max_running_requests": DEFAULT_AR_SERVER_MAX_RUNNING_REQUESTS,
+        "max_running_requests": max_running_requests,
         "chunked_prefill_size": 8192,
         "dtype": "bfloat16",
         # Radix cache is namespaced per ref-audio via Req.extra_key (set in
@@ -411,7 +409,7 @@ def create_vocoder_executor(
     *,
     device: str = "cuda:0",
     dtype: str = "bfloat16",
-    max_batch_size: int = DEFAULT_MAX_CONCURRENCY,
+    max_batch_size: int = 16,
     max_batch_wait_ms: int = 2,
     stream_stride: int = 75,
     stream_followup_stride: int = 75,
@@ -437,9 +435,6 @@ def create_vocoder_executor(
 
 
 __all__ = [
-    "DEFAULT_MAX_CONCURRENCY",
-    "DEFAULT_AR_SERVER_CUDA_GRAPH_MAX_BS",
-    "DEFAULT_AR_SERVER_MAX_RUNNING_REQUESTS",
     "create_audio_encoder_executor",
     "create_preprocessing_executor",
     "create_sglang_tts_engine_executor",

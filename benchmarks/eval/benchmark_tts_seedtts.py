@@ -237,7 +237,8 @@ class TtsSeedttsBenchmarkConfig:
     stream_format: str = "sse"
     initial_codec_chunk_frames: int | None = None
     disable_tqdm: bool = False
-    higgs_ar_max_batch_size: int | None = None
+    max_running_requests: int | None = None
+    cuda_graph_max_bs: int | None = None
     # Transcribe phase
     lang: str = "en"
     device: str = "cuda:0"
@@ -290,7 +291,8 @@ def _build_results_config(
         "request_rate": config.request_rate,
         "stream_format": config.stream_format if config.stream else None,
         "initial_codec_chunk_frames": config.initial_codec_chunk_frames,
-        "higgs_ar_max_batch_size": config.higgs_ar_max_batch_size,
+        "max_running_requests": config.max_running_requests,
+        "cuda_graph_max_bs": config.cuda_graph_max_bs,
     }
 
 
@@ -423,7 +425,8 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
         stream_format=args.stream_format,
         initial_codec_chunk_frames=args.initial_codec_chunk_frames,
         disable_tqdm=args.disable_tqdm,
-        higgs_ar_max_batch_size=args.higgs_ar_max_batch_size,
+        max_running_requests=args.max_running_requests,
+        cuda_graph_max_bs=args.cuda_graph_max_bs,
         lang=args.lang,
         device=args.device,
         similarity_checkpoint=args.similarity_checkpoint,
@@ -432,10 +435,16 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
     )
 
 
-def _build_higgs_ar_server_args(max_batch_size: int | None) -> list[str]:
-    if max_batch_size is None:
-        return []
-    return ["--higgs-ar-max-batch-size", str(max_batch_size)]
+def _build_higgs_ar_server_args(
+    max_running_requests: int | None,
+    cuda_graph_max_bs: int | None,
+) -> list[str]:
+    args: list[str] = []
+    if max_running_requests is not None:
+        args.extend(["--max-running-requests", str(max_running_requests)])
+    if cuda_graph_max_bs is not None:
+        args.extend(["--cuda-graph-max-bs", str(cuda_graph_max_bs)])
+    return args
 
 
 def _parse_token_count(value: str) -> int | str:
@@ -644,12 +653,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Timeout in seconds to wait for server readiness.",
     )
     parser.add_argument(
-        "--higgs-ar-max-batch-size",
+        "--max-running-requests",
         type=int,
         default=None,
         help=(
-            "Higgs AR server batch size override. Sets both max_running_requests "
-            "and cuda_graph_max_bs for the tts_engine stage."
+            "Higgs AR server max_running_requests override for the tts_engine "
+            "stage. Recommended to keep equal to --cuda-graph-max-bs."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-graph-max-bs",
+        type=int,
+        default=None,
+        help=(
+            "Higgs AR server cuda_graph_max_bs override for the tts_engine "
+            "stage. Recommended to keep equal to --max-running-requests."
         ),
     )
     parser.add_argument(
@@ -704,8 +722,10 @@ def main() -> None:
         and args.initial_codec_chunk_frames < 0
     ):
         parser.error("--initial-codec-chunk-frames must be non-negative")
-    if args.higgs_ar_max_batch_size is not None and args.higgs_ar_max_batch_size <= 0:
-        parser.error("--higgs-ar-max-batch-size must be positive")
+    if args.max_running_requests is not None and args.max_running_requests <= 0:
+        parser.error("--max-running-requests must be positive")
+    if args.cuda_graph_max_bs is not None and args.cuda_graph_max_bs <= 0:
+        parser.error("--cuda-graph-max-bs must be positive")
     if args.use_existing_server and not (args.generate_only or args.transcribe_only):
         parser.error(
             "--use-existing-server currently requires --generate-only or "
@@ -747,7 +767,10 @@ def main() -> None:
             model_path=config.model,
             port=config.port,
             host=config.host,
-            extra_args=_build_higgs_ar_server_args(config.higgs_ar_max_batch_size),
+            extra_args=_build_higgs_ar_server_args(
+                config.max_running_requests,
+                config.cuda_graph_max_bs,
+            ),
             log_file=Path(config.output_dir) / "server_logs" / "tts_server.log",
             timeout=args.server_timeout,
             wait_for_gpu_release=wait_for_gpu_release,
