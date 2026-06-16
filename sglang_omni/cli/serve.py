@@ -141,11 +141,11 @@ def _resolve_generation_sglang_stage(
     *,
     flag_name: str,
 ) -> str:
-    stage_name = type(pipeline_config).talker_sglang_role_to_stage().get("talker")
+    stage_name = type(pipeline_config).generation_sglang_role_to_stage().get(
+        "generation"
+    )
     if stage_name is not None:
         return stage_name
-    if any(stage.name == "tts_engine" for stage in pipeline_config.stages):
-        return "tts_engine"
     _raise_unsupported_flag(pipeline_config, flag_name)
 
 
