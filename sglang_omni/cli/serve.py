@@ -141,8 +141,8 @@ def _resolve_generation_sglang_stage(
     *,
     flag_name: str,
 ) -> str:
-    stage_name = type(pipeline_config).generation_sglang_role_to_stage().get(
-        "generation"
+    stage_name = (
+        type(pipeline_config).generation_sglang_role_to_stage().get("generation")
     )
     if stage_name is not None:
         return stage_name
