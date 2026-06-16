@@ -17,13 +17,9 @@ from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
 
 
-def _stage_args(config: PipelineConfig, stage_name: str) -> dict[str, object]:
-    stage = next(s for s in config.stages if s.name == stage_name)
-    return resolve_stage_factory_args(stage, config)
-
-
 def _tts_engine_args(config: PipelineConfig) -> dict[str, object]:
-    return _stage_args(config, "tts_engine")
+    stage = next(s for s in config.stages if s.name == "tts_engine")
+    return resolve_stage_factory_args(stage, config)
 
 
 def test_decode_mode_default_config_is_async():
