@@ -15,7 +15,6 @@ from sglang_omni.models.moss_tts_local.config import MossTTSLocalPipelineConfig
 from sglang_omni.models.qwen3_omni.config import Qwen3OmniSpeechPipelineConfig
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
 from sglang_omni.models.voxtral_tts.config import VoxtralTTSPipelineConfig
-from sglang_omni.models.voxtral_tts.pipeline.next_stage import GENERATION_STAGE
 
 
 def _stage_args(config: PipelineConfig, stage_name: str) -> dict[str, object]:
@@ -140,7 +139,7 @@ def test_generation_server_args_support_voxtral_tts():
         max_running_requests=64,
         cuda_graph_max_bs=64,
     )
-    args = _stage_args(config, GENERATION_STAGE)
+    args = _stage_args(config, "tts_generation")
     overrides = args["server_args_overrides"]
     assert overrides["max_running_requests"] == 64
     assert overrides["cuda_graph_max_bs"] == 64
