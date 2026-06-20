@@ -1111,29 +1111,29 @@ def serve(
         ),
     ] = None,
     max_running_requests: Annotated[
-        int,
+        int | None,
         typer.Option(
             "--max-running-requests",
             "--max_running_requests",
             min=1,
             help=(
-                "SGLang generation stage max_running_requests. Recommended "
-                "to keep equal to --cuda-graph-max-bs. Default 64."
+                "Override SGLang generation stage max_running_requests. "
+                "Omit to use the pipeline config default."
             ),
         ),
-    ] = 64,
+    ] = None,
     cuda_graph_max_bs: Annotated[
-        int,
+        int | None,
         typer.Option(
             "--cuda-graph-max-bs",
             "--cuda_graph_max_bs",
             min=1,
             help=(
-                "SGLang generation stage cuda_graph_max_bs. Recommended to "
-                "keep equal to --max-running-requests. Default 64."
+                "Override SGLang generation stage cuda_graph_max_bs. Omit "
+                "to use the pipeline config default."
             ),
         ),
-    ] = 64,
+    ] = None,
 ) -> None:
     """Serve the pipeline."""
     logging.basicConfig(
@@ -1210,17 +1210,24 @@ def serve(
         decode_mode=decode_mode,
         async_lookahead_min_batch_size=async_lookahead_min_batch_size,
     )
-    generation_stage_name = (
-        type(merged_config).generation_sglang_role_to_stage().get("generation")
-    )
-    if generation_stage_name is not None:
+    generation_server_args_overrides: dict[str, object] = {}
+    if max_running_requests is not None:
+        generation_server_args_overrides["max_running_requests"] = max_running_requests
+    if cuda_graph_max_bs is not None:
+        generation_server_args_overrides["cuda_graph_max_bs"] = cuda_graph_max_bs
+    if generation_server_args_overrides:
+        generation_stage_name = (
+            type(merged_config).generation_sglang_role_to_stage().get("generation")
+        )
+        if generation_stage_name is None:
+            _raise_unsupported_flag(
+                merged_config,
+                "--max-running-requests/--cuda-graph-max-bs",
+            )
         _apply_stage_server_args_override(
             merged_config,
             stage_name=generation_stage_name,
-            updates={
-                "max_running_requests": max_running_requests,
-                "cuda_graph_max_bs": cuda_graph_max_bs,
-            },
+            updates=generation_server_args_overrides,
             reason="SGLang generation server args override",
         )
     merged_config = apply_partial_start_cli_overrides(
