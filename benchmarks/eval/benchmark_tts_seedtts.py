@@ -208,17 +208,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_TTS_BENCHMARK_CONCURRENCY = int(os.getenv("TTS_BENCHMARK_CONCURRENCY", "16"))
 
 
-def _fill_generation_server_arg_defaults(
-    max_running_requests: int | None,
-    cuda_graph_max_bs: int | None,
-) -> tuple[int | None, int | None]:
-    if max_running_requests is None and cuda_graph_max_bs is not None:
-        max_running_requests = cuda_graph_max_bs
-    elif cuda_graph_max_bs is None and max_running_requests is not None:
-        cuda_graph_max_bs = max_running_requests
-    return max_running_requests, cuda_graph_max_bs
-
-
 @dataclass
 class TtsSeedttsBenchmarkConfig:
     model: str
@@ -256,23 +245,14 @@ class TtsSeedttsBenchmarkConfig:
     stream: bool = False
     initial_codec_chunk_frames: int | None = None
     disable_tqdm: bool = False
-    max_running_requests: int | None = None
-    cuda_graph_max_bs: int | None = None
+    max_running_requests: int = 64
+    cuda_graph_max_bs: int = 64
     # Transcribe phase
     lang: str = "en"
     device: str = "cuda:0"
     similarity_checkpoint: str | None = None
     asr_model_path: str = QWEN3_ASR_MODEL_PATH
     asr_concurrency: int = DEFAULT_ASR_TRANSCRIBE_CONCURRENCY
-
-    def __post_init__(self) -> None:
-        (
-            self.max_running_requests,
-            self.cuda_graph_max_bs,
-        ) = _fill_generation_server_arg_defaults(
-            self.max_running_requests,
-            self.cuda_graph_max_bs,
-        )
 
 
 def _build_generation_kwargs(config: TtsSeedttsBenchmarkConfig) -> dict:
@@ -654,23 +634,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-running-requests",
         type=int,
-        default=None,
+        default=64,
         help=(
-            "SGLang generation stage max_running_requests override for the "
-            "server started by this benchmark. Recommended to keep equal to "
-            "--cuda-graph-max-bs. If only one of the two flags is set, the "
-            "other uses the same value."
+            "SGLang generation stage max_running_requests for the server "
+            "started by this benchmark. Recommended to keep equal to "
+            "--cuda-graph-max-bs. Defaults to 64."
         ),
     )
     parser.add_argument(
         "--cuda-graph-max-bs",
         type=int,
-        default=None,
+        default=64,
         help=(
-            "SGLang generation stage cuda_graph_max_bs override for the "
-            "server started by this benchmark. Recommended to keep equal to "
-            "--max-running-requests. If only one of the two flags is set, the "
-            "other uses the same value."
+            "SGLang generation stage cuda_graph_max_bs for the server "
+            "started by this benchmark. Recommended to keep equal to "
+            "--max-running-requests. Defaults to 64."
         ),
     )
     parser.add_argument(
@@ -723,9 +701,9 @@ def main() -> None:
         and args.initial_codec_chunk_frames < 0
     ):
         parser.error("--initial-codec-chunk-frames must be non-negative")
-    if args.max_running_requests is not None and args.max_running_requests <= 0:
+    if args.max_running_requests <= 0:
         parser.error("--max-running-requests must be positive")
-    if args.cuda_graph_max_bs is not None and args.cuda_graph_max_bs <= 0:
+    if args.cuda_graph_max_bs <= 0:
         parser.error("--cuda-graph-max-bs must be positive")
     if args.use_existing_server and not (args.generate_only or args.transcribe_only):
         parser.error(
