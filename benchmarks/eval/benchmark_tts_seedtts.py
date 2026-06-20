@@ -208,6 +208,17 @@ logger = logging.getLogger(__name__)
 DEFAULT_TTS_BENCHMARK_CONCURRENCY = int(os.getenv("TTS_BENCHMARK_CONCURRENCY", "16"))
 
 
+def _fill_generation_server_arg_defaults(
+    max_running_requests: int | None,
+    cuda_graph_max_bs: int | None,
+) -> tuple[int | None, int | None]:
+    if max_running_requests is None and cuda_graph_max_bs is not None:
+        max_running_requests = cuda_graph_max_bs
+    elif cuda_graph_max_bs is None and max_running_requests is not None:
+        cuda_graph_max_bs = max_running_requests
+    return max_running_requests, cuda_graph_max_bs
+
+
 @dataclass
 class TtsSeedttsBenchmarkConfig:
     model: str
@@ -253,6 +264,15 @@ class TtsSeedttsBenchmarkConfig:
     similarity_checkpoint: str | None = None
     asr_model_path: str = QWEN3_ASR_MODEL_PATH
     asr_concurrency: int = DEFAULT_ASR_TRANSCRIBE_CONCURRENCY
+
+    def __post_init__(self) -> None:
+        (
+            self.max_running_requests,
+            self.cuda_graph_max_bs,
+        ) = _fill_generation_server_arg_defaults(
+            self.max_running_requests,
+            self.cuda_graph_max_bs,
+        )
 
 
 def _build_generation_kwargs(config: TtsSeedttsBenchmarkConfig) -> dict:
@@ -638,7 +658,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "SGLang generation stage max_running_requests override for the "
             "server started by this benchmark. Recommended to keep equal to "
-            "--cuda-graph-max-bs."
+            "--cuda-graph-max-bs. If only one of the two flags is set, the "
+            "other uses the same value."
         ),
     )
     parser.add_argument(
@@ -648,7 +669,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "SGLang generation stage cuda_graph_max_bs override for the "
             "server started by this benchmark. Recommended to keep equal to "
-            "--max-running-requests."
+            "--max-running-requests. If only one of the two flags is set, the "
+            "other uses the same value."
         ),
     )
     parser.add_argument(
