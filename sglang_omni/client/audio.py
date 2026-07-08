@@ -276,6 +276,32 @@ def encode_pcm(audio: np.ndarray, sample_rate: int) -> bytes:
     return pcm.tobytes()
 
 
+def select_audio_delta(
+    audio_data: Any,
+    *,
+    emitted_samples: int,
+    is_terminal: bool,
+) -> tuple[np.ndarray | None, int]:
+    """Return the un-emitted audio delta from a streaming audio chunk."""
+
+    audio = to_numpy(audio_data)
+    if audio.ndim > 1:
+        audio = audio.squeeze()
+    if audio.ndim > 1:
+        # Streaming chunks are mono; downmix multi-channel payloads
+        # (e.g. the 48 kHz stereo MOSS-TTS Local codec) instead of
+        # silently dropping channels.
+        channel_axis = 0 if audio.shape[0] < audio.shape[-1] else -1
+        audio = audio.mean(axis=channel_axis).astype("float32")
+
+    total_samples = int(audio.shape[-1]) if audio.ndim else 0
+    if not is_terminal:
+        return audio, emitted_samples + total_samples
+    if total_samples <= emitted_samples:
+        return None, emitted_samples
+    return audio[emitted_samples:], total_samples
+
+
 def encode_audio(
     audio: Any,
     *,
@@ -355,7 +381,7 @@ def encode_audio(
             if not allow_format_fallback:
                 raise ValueError(f"pydub is required to encode response_format={fmt!r}")
             logger.warning(
-                "pydub not installed; falling back to WAV for %s request", fmt
+                f"pydub not installed; falling back to WAV for {fmt} request"
             )
             return encode_wav(arr, sample_rate), FORMAT_MIME_TYPES["wav"]
         except Exception as exc:
@@ -364,7 +390,7 @@ def encode_audio(
                     f"Failed to encode response_format={fmt!r}: {exc}"
                 ) from exc
             logger.warning(
-                "Failed to encode %s; falling back to WAV", fmt, exc_info=True
+                f"Failed to encode {fmt}; falling back to WAV", exc_info=True
             )
             return encode_wav(arr, sample_rate), FORMAT_MIME_TYPES["wav"]
 
@@ -387,7 +413,7 @@ def encode_audio(
 
     if not allow_format_fallback:
         raise ValueError(f"Unsupported audio format: {response_format!r}")
-    logger.warning("Unknown audio format '%s'; falling back to WAV", fmt)
+    logger.warning(f"Unknown audio format '{fmt}'; falling back to WAV")
     return encode_wav(arr, sample_rate), FORMAT_MIME_TYPES["wav"]
 
 

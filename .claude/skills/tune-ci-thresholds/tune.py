@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Observe CI metrics over N runs on the H20 repro host.
+"""Observe CI metrics over N runs on the H100 repro host.
 Emits worst-of-N markdown. Does NOT propose thresholds or edit tests.
 Model-agnostic: pass --model <name>; config comes from
 models/<name>/config.yaml. Metrics come from result JSONs that tests
@@ -11,12 +11,12 @@ import argparse, ast, datetime as dt, hashlib, json, math, os, re, shutil, signa
 import subprocess, sys, time, tomllib
 from pathlib import Path
 
-__version__ = "0.4.4"
+__version__ = "0.6.0"
 
 SKILL_DIR = Path(__file__).resolve().parent
 MODELS_DIR = SKILL_DIR / "models"
 HOSTS_DIR = SKILL_DIR / "hosts"
-DEFAULT_MODEL = "qwen3-omni-v1"
+DEFAULT_MODEL = "omni"
 _SPEAKER_SIM_MIN_BYTES = 100 * 1024 * 1024
 REPO_ROOT = Path("/sgl-workspace/sglang-omni")
 if not REPO_ROOT.exists():
@@ -90,6 +90,16 @@ METRIC_SPECS = {
     "per_sample_wer_max":   dict(worst="max", label="Max per-sample WER (%)", digits=2, scale=100, group="wer"),
     "wer_below_50_corpus":  dict(worst="max", label="Corpus WER ≤50% (%)", digits=2, scale=100, group="wer"),
     "n_above_50":           dict(worst="max", label="Samples >50% WER",      digits=0, scale=1,   group="wer"),
+    "cer_percent":          dict(worst="max", label="CER (%)",               digits=2, scale=1,   group="diarization"),
+    "cer_no_spk_percent":   dict(worst="max", label="CER no-spk (%)",        digits=2, scale=1,   group="diarization"),
+    "cp_cer_percent":       dict(worst="max", label="cpCER (%)",             digits=2, scale=1,   group="diarization"),
+    "cer_no_spk_cp_valid_percent": dict(worst="max", label="CER no-spk cp-valid (%)", digits=2, scale=1, group="diarization"),
+    "delta_cer_percent":    dict(worst="max", label="Delta CER (%)",         digits=2, scale=1,   group="diarization"),
+    "cer_no_spk_below_50_corpus": dict(worst="max", label="CER no-spk ≤50% corpus (%)", digits=2, scale=1, group="diarization"),
+    "n_above_50_pct_cer":   dict(worst="max", label="Samples >50% CER",      digits=0, scale=1,   group="diarization"),
+    "speaker_timestamp_der_percent": dict(worst="max", label="Speaker-timestamp DER (%)", digits=2, scale=1, group="diarization"),
+    "cer_valid_samples":    dict(worst="min", label="CER valid samples",     digits=0, scale=1,   group="diarization"),
+    "cp_cer_valid_samples": dict(worst="min", label="cpCER valid samples",   digits=0, scale=1,   group="diarization"),
     "throughput_qps":       dict(worst="min", label="Throughput (req/s)",    digits=3, scale=1,   group="speed"),
     "output_tok_per_req_s": dict(
         worst="min", label="Output tok/req-s", digits=1, scale=1, group="speed"
@@ -162,6 +172,28 @@ def match_metric(name, nested):
     if "N_ABOVE_50_MAX" in name: return "n_above_50"
     if name == "TTS_MAX_FAILED_REQUESTS" or "MAX_FAILED_REQUESTS" in name:
         return "failed_requests"
+    if "CER_NO_SPK_CP_VALID_PERCENT" in name:
+        return "cer_no_spk_cp_valid_percent"
+    if "CER_NO_SPK_BELOW_50_PERCENT" in name:
+        return "cer_no_spk_below_50_corpus"
+    if "CER_NO_SPK_PERCENT" in name:
+        return "cer_no_spk_percent"
+    if "CP_CER_PERCENT" in name:
+        return "cp_cer_percent"
+    if "DELTA_CER_PERCENT" in name:
+        return "delta_cer_percent"
+    if "N_ABOVE_50_CER_MAX" in name:
+        return "n_above_50_pct_cer"
+    # DER calibrates the reference constant (test derives the MAX via slack),
+    # so match the *_REF symbol; the computed *_MAX literal is left unmatched.
+    if "SPEAKER_TIMESTAMP_DER_PERCENT_REF" in name:
+        return "speaker_timestamp_der_percent"
+    if "CP_CER_VALID_SAMPLES_MIN" in name:
+        return "cp_cer_valid_samples"
+    if "CER_VALID_SAMPLES_MIN" in name:
+        return "cer_valid_samples"
+    if "CER_PERCENT" in name:
+        return "cer_percent"
     if "SIMILARITY" in name and name.endswith("_MIN"):
         return "similarity_mean"
     if "UTMOS" in name and name.endswith("_REFERENCE"):
@@ -170,11 +202,16 @@ def match_metric(name, nested):
     if "WER_MAX_PER_SAMPLE" in name: return "per_sample_wer_max"
     if "CORPUS_WER_MAX" in name: return "corpus_wer"
     if "SAMPLE_WER_MAX" in name: return "per_sample_wer_max"
-    if "THROUGHPUT_MIN" in name: return "throughput_qps"
-    if "LATENCY_MEAN_MAX" in name: return "latency_mean_s"
-    if "LATENCY_P95_MAX" in name: return "latency_p95_s"
-    if "RTF_MEAN_MAX" in name: return "rtf_mean"
-    if "RTF_P95_MAX" in name: return "rtf_p95"
+    if "THROUGHPUT_QPS" in name or "THROUGHPUT_MIN" in name:
+        return "throughput_qps"
+    if "LATENCY_MEAN" in name:
+        return "latency_mean_s"
+    if "LATENCY_P95" in name:
+        return "latency_p95_s"
+    if "RTF_MEAN" in name:
+        return "rtf_mean"
+    if "RTF_P95" in name:
+        return "rtf_p95"
     return None
 
 
@@ -342,6 +379,61 @@ def git_info():
                 dirty=bool(q(["git", "status", "--porcelain"])))
 
 
+def _plan_calibration_sha(plan: dict) -> str:
+    """Git commit this calibration session is bound to."""
+    return plan.get("calibration_git_sha") or plan.get("git_sha") or ""
+
+
+def audit_git_provenance(run_dir: Path, plan=None) -> dict:
+    """Every run{k}.json must record the same git_sha as plan calibration_git_sha."""
+    plan = plan or json.loads((run_dir / "plan.json").read_text())
+    cal_sha = _plan_calibration_sha(plan)
+    if not cal_sha:
+        return dict(
+            ok=False,
+            calibration_git_sha="",
+            missing_sha=[],
+            mismatches=[],
+            reason="plan.json has no calibration_git_sha",
+        )
+    missing_sha = []
+    mismatches = []
+    repeats = plan["repeats"]
+    for sk in plan["stages"]:
+        for k in range(1, repeats + 1):
+            p = run_dir / sk / f"run{k}.json"
+            if not p.exists():
+                continue
+            try:
+                data = json.loads(p.read_text())
+            except (json.JSONDecodeError, OSError):
+                mismatches.append(f"{sk}/run{k}: corrupt json")
+                continue
+            run_sha = data.get("git_sha")
+            if not run_sha:
+                missing_sha.append(f"{sk}/run{k}")
+            elif run_sha != cal_sha:
+                mismatches.append(
+                    f"{sk}/run{k}: artifact {run_sha[:8]} != calibration {cal_sha[:8]}"
+                )
+    ok = not missing_sha and not mismatches
+    reason = ""
+    if missing_sha:
+        reason = (
+            f"{len(missing_sha)} run(s) missing git_sha "
+            "(pre-v0.6.0 or stale — purge and re-run on current commit)"
+        )
+    elif mismatches:
+        reason = f"{len(mismatches)} run(s) recorded on a different commit"
+    return dict(
+        ok=ok,
+        calibration_git_sha=cal_sha,
+        missing_sha=missing_sha,
+        mismatches=mismatches,
+        reason=reason,
+    )
+
+
 def _unique_ordered(items):
     seen, out = set(), []
     for item in items:
@@ -364,6 +456,20 @@ def _required_model_ids_for_tests(cfg, test_names):
     model_ids = []
     for test_name in sorted(set(test_names)):
         model_ids.extend(by_test.get(test_name) or [cfg["hf_model_id"]])
+    return _unique_ordered(model_ids)
+
+
+def _required_model_ids_for_stages(cfg, all_stages, stage_keys):
+    by_test = cfg.get("hf_model_ids_by_test") or {}
+    model_ids = []
+    for sk in stage_keys:
+        stage = all_stages[sk]
+        stage_model_ids = stage.get("hf_model_ids")
+        if stage_model_ids:
+            model_ids.extend(stage_model_ids)
+        else:
+            test_name = Path(stage["test"]).name
+            model_ids.extend(by_test.get(test_name) or [cfg["hf_model_id"]])
     return _unique_ordered(model_ids)
 
 
@@ -411,11 +517,23 @@ def _gpu_memory_used_mib():
     return list(_gpu_memory_by_index().values())
 
 
-def _kill_calibration_gpu_processes():
-    """Match CI omni-post-stage cleanup between calibration runs."""
+def _kill_calibration_gpu_processes(host: dict | None = None):
+    """Match CI omni-post-stage cleanup between calibration runs.
+
+    Cleanup is scoped to ``calibration_gpu_pool`` (respects ``TUNE_GPU_INCLUDE`` and
+    ``TUNE_GPU_EXCLUDE``). Never run global ``pkill`` when either is set — concurrent
+    calibration sessions on the same host must not kill each other's GPUs.
+    """
+    pool = calibration_gpu_pool(host)
+    if not pool:
+        return
     script = REPO_ROOT / ".github/scripts/delete_gpu_process.sh"
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, pool))
     if script.exists():
-        subprocess.run(["bash", str(script)], capture_output=True, check=False)
+        subprocess.run(["bash", str(script)], capture_output=True, check=False, env=env)
+    if excluded_gpu_indices(host) or included_gpu_indices(host):
+        return
     for pattern in (
         "sgl-omni serve",
         "sglang_omni_router.serve",
@@ -442,42 +560,51 @@ def _picked_gpus_under_limit(picked: list[int]) -> bool:
     )
 
 
-def _ready_gpu_indices(gpus_needed: int):
+def _ready_gpu_indices(gpus_needed: int, host: dict | None = None):
     """GPU indices with no compute app and memory <= _GPU_RETRY_MEM_MIB."""
     mem = _gpu_memory_by_index()
     busy = busy_gpu_indices()
+    excluded = excluded_gpu_indices(host)
+    pool = set(calibration_gpu_pool(host))
     ready = [
         idx for idx in sorted(mem)
-        if idx not in busy and mem[idx] <= _GPU_RETRY_MEM_MIB
+        if idx in pool
+        and idx not in excluded
+        and idx not in busy
+        and mem[idx] <= _GPU_RETRY_MEM_MIB
     ]
     return ready, mem, busy
 
 
-def _ensure_gpus_free(gpus_needed: int, timeout: int = _GPU_WAIT_TIMEOUT_S) -> bool:
+def _ensure_gpus_free(gpus_needed: int, timeout: int = _GPU_WAIT_TIMEOUT_S,
+                      host: dict | None = None) -> bool:
     """Kill stale processes and wait until >= gpus_needed GPUs are each < 2 GiB."""
-    _kill_calibration_gpu_processes()
+    _kill_calibration_gpu_processes(host)
     time.sleep(3)
     waited = 0
     last_log = -30
     while waited < timeout:
-        ready, mem, busy = _ready_gpu_indices(gpus_needed)
+        ready, mem, busy = _ready_gpu_indices(gpus_needed, host)
         if len(ready) >= gpus_needed:
             picked_mem = {i: mem[i] for i in ready[:gpus_needed]}
             print(f"  GPU ready for launch {picked_mem} MiB (each <= "
                   f"{_GPU_RETRY_MEM_MIB}) after {waited}s")
             return True
         if waited - last_log >= 30:
+            excluded = sorted(excluded_gpu_indices(host))
             print(f"  waiting: need {gpus_needed} GPU(s) each <= "
                   f"{_GPU_RETRY_MEM_MIB} MiB ({waited}s/{timeout}s): "
-                  f"mem={mem} busy={sorted(busy)} ready={len(ready)}")
+                  f"mem={mem} busy={sorted(busy)} ready={len(ready)} "
+                  f"pool={calibration_gpu_pool(host)} excluded={excluded}")
             last_log = waited
         time.sleep(_GPU_WAIT_POLL_S)
         waited += _GPU_WAIT_POLL_S
         if waited % 60 == 0:
-            _kill_calibration_gpu_processes()
-    subprocess.run(["pkill", "-9", "-f", "sgl-omni"], check=False)
+            _kill_calibration_gpu_processes(host)
+    if not excluded_gpu_indices(host) and not included_gpu_indices(host):
+        subprocess.run(["pkill", "-9", "-f", "sgl-omni"], check=False)
     time.sleep(5)
-    ready, mem, busy = _ready_gpu_indices(gpus_needed)
+    ready, mem, busy = _ready_gpu_indices(gpus_needed, host)
     if len(ready) >= gpus_needed:
         print(f"  GPU ready after forced pkill: "
               f"{ {i: mem[i] for i in ready[:gpus_needed]} } MiB")
@@ -488,15 +615,16 @@ def _ensure_gpus_free(gpus_needed: int, timeout: int = _GPU_WAIT_TIMEOUT_S) -> b
     return False
 
 
-def _pick_gpus_for_launch(gpus_needed: int, label: str) -> tuple[list[int] | None, str]:
+def _pick_gpus_for_launch(gpus_needed: int, label: str,
+                          host: dict | None = None) -> tuple[list[int] | None, str]:
     """Select GPUs only after _ensure_gpus_free; abort if any picked GPU >= 2 GiB."""
-    if not _ensure_gpus_free(gpus_needed):
+    if not _ensure_gpus_free(gpus_needed, host=host):
         return None, "GPU memory not released after cleanup"
-    picked, err = pick_free_gpus(gpus_needed)
+    picked, err = pick_free_gpus(gpus_needed, host)
     if picked is None:
-        if not _ensure_gpus_free(gpus_needed):
+        if not _ensure_gpus_free(gpus_needed, host=host):
             return None, err or "GPU memory not released after cleanup"
-        picked, err = pick_free_gpus(gpus_needed)
+        picked, err = pick_free_gpus(gpus_needed, host)
     if picked is None:
         return None, err or "no GPU under 2 GiB memory limit"
     if not _picked_gpus_under_limit(picked):
@@ -505,7 +633,8 @@ def _pick_gpus_for_launch(gpus_needed: int, label: str) -> tuple[list[int] | Non
     return picked, ""
 
 
-def _launch_gpu_gate(picked: list[int], gpus_needed: int, label: str) -> tuple[list[int] | None, str]:
+def _launch_gpu_gate(picked: list[int], gpus_needed: int, label: str,
+                     host: dict | None = None) -> tuple[list[int] | None, str]:
     """Hard gate immediately before pytest Popen — recheck memory after brief pause."""
     time.sleep(_GPU_LAUNCH_RECHECK_S)
     if _picked_gpus_under_limit(picked):
@@ -516,7 +645,7 @@ def _launch_gpu_gate(picked: list[int], gpus_needed: int, label: str) -> tuple[l
     snap = _picked_gpus_mem_snapshot(picked)
     print(f"{label} launch gate BLOCKED: GPU mem={snap} MiB — "
           f"releasing before restart")
-    return _pick_gpus_for_launch(gpus_needed, label)
+    return _pick_gpus_for_launch(gpus_needed, label, host)
 
 
 def _stage_metrics_complete(stage, metrics):
@@ -546,7 +675,12 @@ def _stage_counts_complete(stage, sample_counts):
         return True
     total = (sample_counts or {}).get("total")
     ok = (sample_counts or {}).get("ok")
-    return total is not None and ok is not None and ok == total
+    if total is None or ok is None or ok != total:
+        return False
+    expected = stage.get("expected_samples")
+    if expected is not None and total != expected:
+        return False
+    return True
 
 
 def _observation_status(stage, metrics, pytest_status, pytest_reason):
@@ -625,7 +759,19 @@ def audit_completeness(run_dir: Path, all_stages=None, plan=None):
                 if p.exists():
                     try:
                         d = json.loads(p.read_text())
-                        reason = d.get("reason") or d.get("status") or "incomplete metrics"
+                        sc = d.get("sample_counts") or {}
+                        expected = stage.get("expected_samples")
+                        if (
+                            expected is not None
+                            and sc.get("total") is not None
+                            and sc.get("total") != expected
+                        ):
+                            reason = (
+                                f"sample scope mismatch "
+                                f"(total {sc.get('total')} != expected {expected})"
+                            )
+                        else:
+                            reason = d.get("reason") or d.get("status") or "incomplete metrics"
                     except (json.JSONDecodeError, OSError):
                         reason = "corrupt json"
                 missing.append({"stage_key": sk, "run": k, "reason": reason})
@@ -638,6 +784,113 @@ def audit_completeness(run_dir: Path, all_stages=None, plan=None):
         repeats=repeats,
         model=plan.get("model"),
     )
+
+
+def strict_classify_cell(path: Path, stage: dict) -> str:
+    """Classify one stage-run for strict worst-of-N (✓ / △ / ✗ / —)."""
+    if not path.exists():
+        return "—"
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return "✗"
+    sample_counts = data.get("sample_counts") or {}
+    total = sample_counts.get("total")
+    ok = sample_counts.get("ok")
+    metrics = data.get("metrics") or {}
+    has_all = bool(metrics) and all(v is not None for v in metrics.values())
+    if not has_all:
+        return "✗"
+    if total is None or ok is None:
+        return "✗"
+    if ok != total:
+        return "△"
+    expected = stage.get("expected_samples")
+    if expected is not None and total != expected:
+        return "✗"
+    return "✓"
+
+
+def strict_audit(run_dir: Path, all_stages=None, plan=None) -> dict:
+    """Strict worst-of-N readiness — every stage must have N full-scope ✓ repeats."""
+    plan = plan or json.loads((run_dir / "plan.json").read_text())
+    if all_stages is None:
+        sy = Path(plan.get("stages_yaml")
+                  or stages_path(plan.get("model", DEFAULT_MODEL)))
+        all_stages = _load_yaml(sy)
+    repeats = plan["repeats"]
+    stage_rows = []
+    ready = 0
+    for sk in plan["stages"]:
+        stage = all_stages[sk]
+        cells = [
+            strict_classify_cell(run_dir / sk / f"run{k}.json", stage)
+            for k in range(1, repeats + 1)
+        ]
+        strict_ok = cells.count("✓")
+        if strict_ok == repeats:
+            ready += 1
+        stage_rows.append(dict(
+            stage_key=sk,
+            cells=cells,
+            strict_ok=strict_ok,
+            expected_samples=stage.get("expected_samples"),
+        ))
+    return dict(
+        strict_ready=ready,
+        total_stages=len(plan["stages"]),
+        repeats=repeats,
+        stages=stage_rows,
+        strict_complete=(ready == len(plan["stages"])),
+        git_provenance=audit_git_provenance(run_dir, plan),
+    )
+
+
+def strict_audit_cmd(run_dir: Path) -> int:
+    plan_path = run_dir / "plan.json"
+    if not plan_path.exists():
+        print(f"error: no plan.json in {run_dir}")
+        return 1
+    plan = json.loads(plan_path.read_text())
+    sy = Path(plan.get("stages_yaml")
+              or stages_path(plan.get("model", DEFAULT_MODEL)))
+    all_stages = _load_yaml(sy)
+    audit = strict_audit(run_dir, all_stages, plan)
+    git = audit["git_provenance"]
+    cal_sha = git["calibration_git_sha"]
+    if cal_sha:
+        print(f"calibration_git_sha: {cal_sha}")
+    if not git["ok"]:
+        print(f"GIT PROVENANCE: FAIL — {git['reason']}")
+        for item in git["mismatches"][:10]:
+            print(f"  {item}")
+        for item in git["missing_sha"][:10]:
+            print(f"  {item}")
+        if len(git["mismatches"]) > 10 or len(git["missing_sha"]) > 10:
+            extra = len(git["mismatches"]) + len(git["missing_sha"]) - 10
+            print(f"  … and {extra} more")
+    else:
+        print("GIT PROVENANCE: ok (all artifacts match calibration commit)")
+    for row in audit["stages"]:
+        cells = row["cells"]
+        exp = row["expected_samples"]
+        exp_note = f", expected={exp}" if exp is not None else ""
+        print(
+            f"{row['stage_key']}: {''.join(cells)} "
+            f"({row['strict_ok']}/{audit['repeats']} strict{exp_note})"
+        )
+    print(
+        f"STRICT READY: {audit['strict_ready']}/{audit['total_stages']} stages "
+        f"({audit['repeats']} repeats each)"
+    )
+    metrics_ok = audit["strict_complete"]
+    git_ok = git["ok"]
+    if metrics_ok and git_ok:
+        print("STRICT + GIT: READY")
+    elif metrics_ok and not git_ok:
+        print("STRICT metrics ok but GIT PROVENANCE failed — purge stale runs or "
+              "start a fresh --output-dir on the current commit")
+    return 0 if metrics_ok and git_ok else 1
 
 
 def busy_gpu_indices():
@@ -668,19 +921,79 @@ def all_gpu_indices():
     return out
 
 
-def pick_free_gpus(n):
+def _parse_gpu_index_list(raw: str | list | tuple | None) -> set[int]:
+    if raw is None:
+        return set()
+    if isinstance(raw, (list, tuple)):
+        return {int(x) for x in raw}
+    out: set[int] = set()
+    for part in str(raw).split(","):
+        part = part.strip()
+        if part.isdigit():
+            out.add(int(part))
+    return out
+
+
+def excluded_gpu_indices(host: dict | None = None) -> set[int]:
+    """GPUs calibration must never pick or kill (e.g. CI-reserved 6,7 on 8× hosts)."""
+    raw = os.environ.get("TUNE_GPU_EXCLUDE")
+    if raw:
+        return _parse_gpu_index_list(raw)
+    if host:
+        return _parse_gpu_index_list(host.get("gpu_exclude"))
+    return set()
+
+
+def included_gpu_indices(host: dict | None = None) -> set[int] | None:
+    """When set via ``TUNE_GPU_INCLUDE``, pin pick/cleanup to exactly these GPUs.
+
+    Used for concurrent calibration sessions on shared hosts (e.g. 0,1 vs 2,3).
+    """
+    raw = os.environ.get("TUNE_GPU_INCLUDE")
+    if not raw:
+        return None
+    included = _parse_gpu_index_list(raw)
+    excluded = excluded_gpu_indices(host)
+    pinned = included - excluded
+    if not pinned:
+        raise RuntimeError(
+            f"TUNE_GPU_INCLUDE={raw!r} empty after excluding {sorted(excluded)}"
+        )
+    return pinned
+
+
+def calibration_gpu_pool(host: dict | None = None) -> list[int]:
+    excluded = excluded_gpu_indices(host)
+    pool = [i for i in all_gpu_indices() if i not in excluded]
+    pinned = included_gpu_indices(host)
+    if pinned is not None:
+        pool = [i for i in pool if i in pinned]
+    return pool
+
+
+def pick_free_gpus(n, host: dict | None = None):
     """Pick n GPUs with no compute app and memory <= _GPU_RETRY_MEM_MIB (2 GiB)."""
-    ready, mem, busy = _ready_gpu_indices(n)
-    all_idx = all_gpu_indices()
+    pinned = included_gpu_indices(host)
+    if pinned is not None and len(pinned) == n:
+        picked = sorted(pinned)
+        if _picked_gpus_under_limit(picked):
+            return picked, None
+        snap = _picked_gpus_mem_snapshot(picked)
+        return None, (
+            f"pinned GPU(s) {picked} not each <= {_GPU_RETRY_MEM_MIB} MiB: {snap}"
+        )
+    ready, mem, busy = _ready_gpu_indices(n, host)
+    all_idx = calibration_gpu_pool(host)
     if len(ready) >= n:
         picked = ready[:n]
         if not _picked_gpus_under_limit(picked):
             snap = _picked_gpus_mem_snapshot(picked)
             return None, f"internal: picked GPUs exceed {_GPU_RETRY_MEM_MIB} MiB: {snap}"
         return picked, None
+    pin_msg = f" pinned={sorted(pinned)}" if pinned is not None else ""
     return None, (
         f"need {n} GPU(s) each <= {_GPU_RETRY_MEM_MIB} MiB (2 GiB); "
-        f"ready {len(ready)}/{len(all_idx)} mem={mem} busy={sorted(busy)}"
+        f"ready {len(ready)}/{len(all_idx)} mem={mem} busy={sorted(busy)}{pin_msg}"
     )
 
 
@@ -801,17 +1114,18 @@ def precheck(py, src, out, skip_ver, cfg, datasets_override=None,
             print(f"    {mark} dataset: {ds}")
     if missing:
         lines = [f"{len(missing)} asset(s) not cached locally. "
-                 "Run these to download via the HF mirror:"]
+                 "Run these to download from Hugging Face:"]
         for repo_id, kind in missing:
             flag = " --repo-type dataset" if kind == "dataset" else ""
             lines.append(
-                "  HF_ENDPOINT=https://hf-mirror.com "
+                "  HF_ENDPOINT=https://huggingface.co "
                 f"huggingface-cli download {repo_id}{flag}"
             )
         errs.append("\n".join(lines))
     sim_dir = cfg["auto_env"].get("SEEDTTS_SIM_CACHE_DIR")
-    needs_speaker_sim = bool(cfg.get("_host")) or cfg["name"] in (
-        "tts", "qwen3-omni-v1")
+    needs_speaker_sim = bool(
+        cfg.get("requires_speaker_sim", cfg["name"] in ("tts", "omni"))
+    )
     if sim_dir and needs_speaker_sim:
         sim_ok, sim_detail = _speaker_sim_assets_ok(Path(sim_dir))
         mark = "✓" if sim_ok else "✗"
@@ -832,15 +1146,21 @@ def precheck(py, src, out, skip_ver, cfg, datasets_override=None,
     if not smi:
         errs.append("nvidia-smi -L returned no GPUs")
     else:
-        all_idx = all_gpu_indices()
+        pool = calibration_gpu_pool(cfg.get("_host"))
+        excluded = sorted(excluded_gpu_indices(cfg.get("_host")))
         busy = busy_gpu_indices()
-        free_count = len(all_idx) - len(busy)
+        ready, _, _ = _ready_gpu_indices(1, cfg.get("_host"))
+        free_count = len(ready)
         summary = gpu_summary(smi)
-        if busy:
-            print(f"  GPUs: {summary} — {free_count}/{len(all_idx)} free "
-                  f"(busy: {sorted(busy)})")
+        pinned = sorted(included_gpu_indices(cfg.get("_host")) or [])
+        pool_note = f" pool={pool}" if (excluded or pinned) else ""
+        pin_note = f" pinned={pinned}" if pinned else ""
+        if busy or excluded or pinned:
+            print(f"  GPUs: {summary} — {free_count}/{len(pool)} calibration-ready"
+                  f"{pool_note}{pin_note} (busy: {sorted(busy)}"
+                  f"{f', excluded: {excluded}' if excluded else ''})")
         else:
-            print(f"  GPUs: {summary} — {free_count}/{len(all_idx)} free")
+            print(f"  GPUs: {summary} — {free_count}/{len(pool)} calibration-ready")
         gpu_required = gpu_required_override
         if gpu_required is None:
             gpu_required = max((cfg.get("gpus_per_test") or {}).values(), default=1)
@@ -869,18 +1189,73 @@ def _summary(errs, warns):
 
 def _constants(tree):
     for n in tree.body:
-        if not isinstance(n, ast.Assign): continue
-        for t in n.targets:
+        if isinstance(n, ast.Assign):
+            targets, value = n.targets, n.value
+        elif isinstance(n, ast.AnnAssign) and n.value is not None:
+            targets, value = [n.target], n.value
+        else:
+            continue
+        for t in targets:
             if not (isinstance(t, ast.Name)
                     and re.fullmatch(r"_?[A-Z][A-Z0-9_]*", t.id)):
                 continue
             yield (t.id, None)
-            if isinstance(n.value, ast.Dict):
-                for vv in n.value.values:
+            if isinstance(value, ast.Dict):
+                for vv in value.values:
                     if isinstance(vv, ast.Dict):
                         for kk in vv.keys:
                             if isinstance(kk, ast.Constant) and isinstance(kk.value, str):
                                 yield (t.id, kk.value)
+
+
+_SLACK_HELPER_CALLS = frozenset({"apply_wer_slack", "apply_mos_slack"})
+_SLACK_ENV_NAMES = frozenset({"THRESHOLD_SLACK_LOWER", "THRESHOLD_SLACK_HIGHER"})
+# Prefixed variants (e.g. AISHELL4_LONG_THRESHOLD_SLACK_LOWER) are matched by
+# suffix so a stage group can widen its slack without touching this module.
+_SLACK_ENV_SUFFIXES = ("THRESHOLD_SLACK_LOWER", "THRESHOLD_SLACK_HIGHER")
+
+
+def _expr_uses_slack(node: ast.AST) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and (
+            child.id in _SLACK_ENV_NAMES or child.id.endswith(_SLACK_ENV_SUFFIXES)
+        ):
+            return True
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+            if child.func.id in _SLACK_HELPER_CALLS:
+                return True
+    return False
+
+
+def _slack_derived_threshold_names(tree: ast.AST) -> set[str]:
+    """Names assigned from a reference via THRESHOLD_SLACK_* or apply_*_slack().
+
+    Calibration must write the reference literal only; CI derives assertion
+    thresholds (MAX/MIN/THRESHOLD) from slack — never apply worst-of-N to these.
+    """
+    derived: set[str] = set()
+    for n in tree.body:
+        if isinstance(n, ast.Assign):
+            targets, value = n.targets, n.value
+        elif isinstance(n, ast.AnnAssign) and n.value is not None:
+            targets, value = [n.target], n.value
+        else:
+            continue
+        if not _expr_uses_slack(value):
+            continue
+        for t in targets:
+            if isinstance(t, ast.Name):
+                derived.add(t.id)
+    return derived
+
+
+def _pick_calibration_constant(candidates: list[tuple[str, str | None]]) -> tuple[str, str | None]:
+    """Prefer *_REF / *_REFERENCE over bare *_MAX / *_MIN calibration targets."""
+    for suffix in ("_REF", "_REFERENCE"):
+        for name, nested in candidates:
+            if name.endswith(suffix):
+                return name, nested
+    return candidates[0]
 
 
 def _ctx_vars(tree):
@@ -894,6 +1269,56 @@ def _ctx_vars(tree):
                 and n.value.id not in _TTS_FIXED_PRESETS:
             seen.append(n.value.id)
     return seen
+
+
+def _int_constant(tree, name: str) -> int | None:
+    """Return int literal for ``NAME = <int>``; None if missing, non-int, or ``None``."""
+    for n in tree.body:
+        if isinstance(n, ast.Assign):
+            targets, value = n.targets, n.value
+        elif isinstance(n, ast.AnnAssign) and n.value is not None:
+            targets, value = [n.target], n.value
+        else:
+            continue
+        for t in targets:
+            if isinstance(t, ast.Name) and t.id == name:
+                if isinstance(value, ast.Constant):
+                    if isinstance(value.value, int):
+                        return value.value
+                    return None
+    return None
+
+
+def _expected_samples(
+    tree,
+    group: str,
+    variant: str | None,
+    context_vars: list[str] | None,
+) -> int | None:
+    """Resolve CI sample scope from test-file constants (written to stages.yaml)."""
+    for const_name in context_vars or []:
+        value = _int_constant(tree, const_name)
+        if isinstance(value, int):
+            return value
+    if group == "similarity":
+        value = _int_constant(tree, "TTS_SIMILARITY_MAX_SAMPLES")
+        if isinstance(value, int):
+            return value
+    if variant == "stream":
+        stream_cap = _int_constant(tree, "STREAMING_BENCHMARK_MAX_SAMPLES")
+        if isinstance(stream_cap, int):
+            return stream_cap
+        fullset = _int_constant(tree, "SEEDTTS_EN_FULLSET_SAMPLES")
+        if isinstance(fullset, int):
+            return fullset
+    if group in ("wer", "speed", "utmos"):
+        value = _int_constant(tree, "SEEDTTS_EN_FULLSET_SAMPLES")
+        if isinstance(value, int):
+            return value
+    value = _int_constant(tree, "SEEDTTS_ASR_CORRECTNESS_SAMPLES")
+    if isinstance(value, int):
+        return value
+    return None
 
 
 def _stage_base(path, cfg):
@@ -928,23 +1353,126 @@ def _build_sample_counts(sc_raw, default_file):
     return out
 
 
-def _emit_groups(constants, cfg_paths, default_file, counters):
+def _calibration_presets(ms, base_extra):
+    """Return stage env/GPU overlays for non-random calibration presets.
+
+    CI may randomly pick one runtime preset, but calibration must observe
+    every configured preset. A metric_source can therefore declare
+    `calibration_presets`, and discover expands one stage set per preset.
+    """
+    presets = ms.get("calibration_presets") or {}
+    if not presets:
+        return [(None, base_extra, None, None)]
+    out = []
+    for name, raw in presets.items():
+        raw = raw or {}
+        env = dict(base_extra)
+        env.update(raw.get("extra_env") or {})
+        gpus = raw.get("gpus")
+        model_ids = raw.get("hf_model_ids")
+        out.append((name, env, gpus, model_ids))
+    return out
+
+
+def _stage_key(base, group, variant=None, calibration_preset=None):
+    parts = [base]
+    if calibration_preset:
+        parts.append(str(calibration_preset))
+    if variant:
+        parts.append(str(variant))
+    parts.append(group)
+    return "_".join(parts)
+
+
+def _stage_title(base, group, variant=None, calibration_preset=None):
+    parts = [base.replace("_", " ").upper()]
+    if calibration_preset:
+        parts.append(str(calibration_preset).upper())
+    if variant:
+        parts.append(str(variant).upper())
+    parts.append(group.capitalize())
+    return " ".join(parts)
+
+
+def _stage_entry(
+    rel,
+    title,
+    group,
+    extra_env,
+    context_vars,
+    test_file_sha256,
+    metrics,
+    sample_counts,
+    variant=None,
+    calibration_preset=None,
+    gpus=None,
+    hf_model_ids=None,
+    threshold_file=None,
+    threshold_file_sha256=None,
+    expected_samples=None,
+):
+    entry = dict(
+        test=rel,
+        title=title,
+        group=group,
+        extra_env=extra_env,
+        context_vars=context_vars,
+        test_file_sha256=test_file_sha256,
+        last_discovered_at=now_iso(),
+        metrics=metrics,
+        sample_counts=sample_counts,
+    )
+    if expected_samples is not None:
+        entry["expected_samples"] = int(expected_samples)
+    if variant:
+        entry["variant"] = variant
+    if calibration_preset:
+        entry["calibration_preset"] = calibration_preset
+    if gpus:
+        entry["gpus"] = int(gpus)
+    if hf_model_ids:
+        entry["hf_model_ids"] = hf_model_ids
+    if threshold_file:
+        entry["threshold_file"] = threshold_file
+        entry["threshold_file_sha256"] = threshold_file_sha256
+    return entry
+
+
+def _emit_groups(constants, cfg_paths, default_file, counters,
+                 slack_derived: set[str] | None = None):
     """Build {group: {metric_kind: metric_dict}} from a constant list."""
-    groups = {}
+    slack_derived = slack_derived or set()
+    by_metric: dict[str, list[tuple[str, str | None]]] = {}
     for name, nested in constants:
+        if name in slack_derived or name.endswith("_THRESHOLD"):
+            continue
         mk = match_metric(name, nested)
         if mk is None:
             continue
+        by_metric.setdefault(mk, []).append((name, nested))
+    groups: dict[str, dict] = {}
+    for mk, candidates in by_metric.items():
+        name, nested = _pick_calibration_constant(candidates)
         spec = METRIC_SPECS[mk]
         jf, jp = _split_source(cfg_paths.get(mk), default_file)
         status = "OK" if (jf and jp) else "NEEDS_CONFIG"
-        if status == "OK": counters[0] += 1
-        else: counters[1] += 1
+        if status == "OK":
+            counters[0] += 1
+        else:
+            counters[1] += 1
         src = f"{name}[{nested!r}]" if nested else name
-        groups.setdefault(spec["group"], {})[mk] = dict(source=src,
-            json_file=jf, json_path=jp, worst=spec["worst"],
-            display=dict(label=spec["label"], scale=spec["scale"],
-                         digits=spec["digits"]), status=status)
+        groups.setdefault(spec["group"], {})[mk] = dict(
+            source=src,
+            json_file=jf,
+            json_path=jp,
+            worst=spec["worst"],
+            display=dict(
+                label=spec["label"],
+                scale=spec["scale"],
+                digits=spec["digits"],
+            ),
+            status=status,
+        )
     return groups
 
 
@@ -1078,9 +1606,15 @@ def discover(out, only, cfg):
             print(f"  [warn] {tp.name}: no auto-inference available, "
                   f"needs metric_sources in config.yaml")
         ms = _merge_metric_sources(inferred, ms)
+        threshold_rel = ms.get("threshold_file")
+        threshold_tp = REPO_ROOT / threshold_rel if threshold_rel else tp
+        threshold_tree = ast.parse(threshold_tp.read_text())
+        threshold_sha = sha256(threshold_tp)
+        threshold_file_sha = threshold_sha if threshold_rel else None
         ignored_constants = set(ms.get("ignored_constants") or [])
+        slack_derived = _slack_derived_threshold_names(threshold_tree)
         all_constants = [
-            (n, k) for (n, k) in _constants(tree)
+            (n, k) for (n, k) in _constants(threshold_tree)
             if n not in ignored_constants
         ]
         variants = ms.get("variants") or {}
@@ -1097,19 +1631,65 @@ def discover(out, only, cfg):
                 v_sc_default = _build_sample_counts(
                     vcfg.get("sample_counts") or {}, v_default)
                 sc_by_group = vcfg.get("sample_counts_by_group") or {}
-                v_groups = _emit_groups(claimed, v_paths, v_default, counters)
-                for g, metrics in v_groups.items():
-                    if g in sc_by_group:
-                        group_sc = _build_sample_counts(sc_by_group[g], v_default)
+                for (
+                    preset_name,
+                    preset_env,
+                    preset_gpus,
+                    preset_model_ids,
+                ) in _calibration_presets(ms, extra):
+                    preset_raw = (ms.get("calibration_presets") or {}).get(
+                        preset_name, {}
+                    ) or {}
+                    preset_filter = preset_raw.get("constant_filter")
+                    if preset_filter:
+                        ppat = re.compile(preset_filter)
+                        preset_claimed = [
+                            (n, k)
+                            for (n, k) in claimed
+                            if ppat.match(n.lstrip("_"))
+                        ]
                     else:
-                        group_sc = v_sc_default
-                    key = f"{base}_{vname}_{g}"
-                    title = (f"{base.replace('_', ' ').upper()} "
-                             f"{vname.upper()} {g.capitalize()}")
-                    stages[key] = dict(test=rel, title=title, group=g,
-                        variant=vname, extra_env=extra, context_vars=ctx,
-                        test_file_sha256=sha, last_discovered_at=now_iso(),
-                        metrics=metrics, sample_counts=group_sc)
+                        preset_claimed = claimed
+                    v_groups = _emit_groups(
+                        preset_claimed, v_paths, v_default, counters,
+                        slack_derived=slack_derived,
+                    )
+                    for g, metrics in v_groups.items():
+                        if g in sc_by_group:
+                            group_sc = _build_sample_counts(
+                                sc_by_group[g], v_default
+                            )
+                        else:
+                            group_sc = v_sc_default
+                        key = _stage_key(
+                            base,
+                            g,
+                            variant=vname,
+                            calibration_preset=preset_name,
+                        )
+                        stages[key] = _stage_entry(
+                            rel,
+                            _stage_title(
+                                base,
+                                g,
+                                variant=vname,
+                                calibration_preset=preset_name,
+                            ),
+                            g,
+                            preset_env,
+                            ctx,
+                            sha,
+                            metrics,
+                            group_sc,
+                            variant=vname,
+                            calibration_preset=preset_name,
+                            gpus=preset_gpus,
+                            hf_model_ids=preset_model_ids,
+                            threshold_file=threshold_rel,
+                            threshold_file_sha256=threshold_file_sha,
+                            expected_samples=_expected_samples(
+                                tree, g, vname, ctx),
+                        )
         else:
             # Single-source flow (one result-JSON tree per test file).
             default_file = ms.get("json_file")
@@ -1117,18 +1697,46 @@ def discover(out, only, cfg):
             default_sample_counts = _build_sample_counts(
                 ms.get("sample_counts") or {}, default_file)
             sc_by_group = ms.get("sample_counts_by_group") or {}
-            groups = _emit_groups(all_constants, cfg_paths, default_file, counters)
+            groups = _emit_groups(
+                all_constants, cfg_paths, default_file, counters,
+                slack_derived=slack_derived,
+            )
             for g, metrics in groups.items():
                 if g in sc_by_group:
                     sample_counts = _build_sample_counts(sc_by_group[g], default_file)
                 else:
                     sample_counts = default_sample_counts
-                key = f"{base}_{g}"
-                title = f"{base.replace('_', ' ').upper()} {g.capitalize()}"
-                stages[key] = dict(test=rel, title=title, group=g,
-                    extra_env=extra, context_vars=ctx, test_file_sha256=sha,
-                    last_discovered_at=now_iso(), metrics=metrics,
-                    sample_counts=sample_counts)
+                for (
+                    preset_name,
+                    preset_env,
+                    preset_gpus,
+                    preset_model_ids,
+                ) in _calibration_presets(ms, extra):
+                    key = _stage_key(
+                        base,
+                        g,
+                        calibration_preset=preset_name,
+                    )
+                    stages[key] = _stage_entry(
+                        rel,
+                        _stage_title(
+                            base,
+                            g,
+                            calibration_preset=preset_name,
+                        ),
+                        g,
+                        preset_env,
+                        ctx,
+                        sha,
+                        metrics,
+                        sample_counts,
+                        calibration_preset=preset_name,
+                        gpus=preset_gpus,
+                        hf_model_ids=preset_model_ids,
+                        threshold_file=threshold_rel,
+                        threshold_file_sha256=threshold_file_sha,
+                        expected_samples=_expected_samples(tree, g, None, ctx),
+                    )
     if only: stages = {k: v for k, v in stages.items() if k == only}
     out.parent.mkdir(parents=True, exist_ok=True)
     _write_yaml(stages, out)
@@ -1157,8 +1765,20 @@ def _write_yaml(stages, path):
             L.append("  context_vars: []")
         if e.get("variant"):
             L.append(f"  variant: {_yq(e['variant'])}")
+        if e.get("calibration_preset"):
+            L.append(f"  calibration_preset: {_yq(e['calibration_preset'])}")
+        if e.get("gpus"):
+            L.append(f"  gpus: {int(e['gpus'])}")
+        if e.get("hf_model_ids"):
+            L.append("  hf_model_ids:")
+            L += [f"    - {_yq(v)}" for v in e["hf_model_ids"]]
         L += [f"  test_file_sha256: {e['test_file_sha256']}",
               f"  last_discovered_at: {e['last_discovered_at']}"]
+        if e.get("expected_samples") is not None:
+            L.append(f"  expected_samples: {int(e['expected_samples'])}")
+        if e.get("threshold_file"):
+            L += [f"  threshold_file: {_yq(e['threshold_file'])}",
+                  f"  threshold_file_sha256: {e['threshold_file_sha256']}"]
         sc = e.get("sample_counts") or {}
         if sc:
             L.append("  sample_counts:")
@@ -1249,14 +1869,35 @@ def _stage_meta_base(sk, stage):
     return None
 
 
+def _stage_alias_bases(sk, stage):
+    """Return every base token that should expand to this stage.
+
+    Example: `tts_moss_nonstream_speed` advertises:
+    `tts_moss_nonstream`, `tts_moss`, and `tts`.
+    """
+    bases = []
+
+    def add(value):
+        if value and value not in bases:
+            bases.append(value)
+
+    base = _stage_base_of(sk, stage)
+    add(base)
+    v = stage.get("variant")
+    if v and base.endswith(f"_{v}"):
+        add(base[:-len(v) - 1])
+    p = stage.get("calibration_preset")
+    for candidate in list(bases):
+        if p and candidate.endswith(f"_{p}"):
+            add(candidate[:-len(p) - 1])
+    return bases
+
+
 def _build_aliases(all_stages):
     by_base, by_group = {}, {}
     for sk, v in all_stages.items():
-        b = _stage_base_of(sk, v)
-        by_base.setdefault(b, []).append(sk)
-        meta = _stage_meta_base(sk, v)
-        if meta and meta != b:
-            by_base.setdefault(meta, []).append(sk)
+        for b in _stage_alias_bases(sk, v):
+            by_base.setdefault(b, []).append(sk)
         by_group.setdefault(v.get("group", ""), []).append(sk)
     return by_base, by_group
 
@@ -1283,6 +1924,30 @@ def _expand_stages(tokens, all_stages):
     return out
 
 
+def _stage_gpus(stage, gpus_per_test):
+    if stage.get("gpus"):
+        return int(stage["gpus"])
+    return gpus_per_test.get(Path(stage["test"]).name, 2)
+
+
+def _stage_env_key(stage):
+    return tuple(sorted((stage.get("extra_env") or {}).items()))
+
+
+def _run_namespace(test_path, stage_keys, all_stages):
+    test_base = Path(test_path).stem
+    presets = sorted({
+        str(all_stages[sk].get("calibration_preset"))
+        for sk in stage_keys
+        if all_stages[sk].get("calibration_preset")
+    })
+    if presets:
+        suffix = "__" + "_".join(presets)
+    else:
+        suffix = ""
+    return f"{test_base}{suffix}"
+
+
 def stages_list(cfg):
     sy = stages_path(cfg["name"])
     if not sy.exists():
@@ -1298,7 +1963,12 @@ def stages_list(cfg):
         print(f"  {base}  ({tp})")
         for sk in keys:
             g = all_stages[sk].get("group", "")
-            print(f"    {sk}  [{g}]")
+            details = [g]
+            if all_stages[sk].get("calibration_preset"):
+                details.append(f"preset={all_stages[sk]['calibration_preset']}")
+            if all_stages[sk].get("gpus"):
+                details.append(f"gpus={all_stages[sk]['gpus']}")
+            print(f"    {sk}  [{', '.join(details)}]")
     print("groups:")
     for g in sorted(by_group):
         if not g: continue
@@ -1352,6 +2022,15 @@ def _run_cmd_inner(args, cfg, py, src, out):
         if sha256(tf) != all_stages[s].get("test_file_sha256"):
             print(f"warning: {s} test sha mismatch — "
                   f"run `tune.py discover --model {cfg['name']}`")
+        threshold_file = all_stages[s].get("threshold_file")
+        if threshold_file:
+            th = REPO_ROOT / threshold_file
+            if not th.exists():
+                print(f"error: threshold file missing for {s}: {th}")
+                return 2
+            if sha256(th) != all_stages[s].get("threshold_file_sha256"):
+                print(f"warning: {s} threshold sha mismatch — "
+                      f"run `tune.py discover --model {cfg['name']}`")
     # Which datasets do the selected tests actually reference?
     # Each test uses DATASETS["key"]; resolve key → repo_id via the
     # canonical benchmarks/dataset/prepare.py:DATASETS dict so we don't
@@ -1372,11 +2051,10 @@ def _run_cmd_inner(args, cfg, py, src, out):
     if extras:
         print(f"note: test(s) reference repo(s) not listed in "
               f"config.yaml hf_datasets: {extras}")
-    selected_tests = [Path(all_stages[s]["test"]).name for s in sel]
-    required_models = _required_model_ids_for_tests(cfg, selected_tests)
+    required_models = _required_model_ids_for_stages(cfg, all_stages, sel)
     gpus_per_test = cfg.get("gpus_per_test", {}) or {}
     selected_gpu_requirement = max(
-        (gpus_per_test.get(Path(all_stages[s]["test"]).name, 2) for s in sel),
+        (_stage_gpus(all_stages[s], gpus_per_test) for s in sel),
         default=1,
     )
     if not args.skip_precheck:
@@ -1393,33 +2071,102 @@ def _run_cmd_inner(args, cfg, py, src, out):
             versions={}, pins={}, git=git_info(),
             nvidia_smi_L=smi, gpu_summary=gpu_summary(smi)), indent=2))
     gi = git_info()
-    (out / "plan.json").write_text(json.dumps(dict(
-        model=cfg["name"], stages=sel, repeats=args.repeats,
-        timestamp=now_iso(), git_sha=gi["sha"], git_branch=gi["branch"],
-        dirty=gi["dirty"], venv_python=py, venv_source=src,
-        tune_version=__version__, stages_yaml=str(sy)), indent=2))
+    plan_path = out / "plan.json"
+    if not args.resume and plan_path.exists():
+        print(
+            "error: output-dir already contains plan.json.\n"
+            "  A new calibration request requires a **fresh** --output-dir named "
+            "with the current UTC timestamp (e.g. "
+            ".tune-runs/$(date -u +%Y%m%dT%H%M%SZ)_<label>/).\n"
+            "  Pass --resume only when the user explicitly asked to continue "
+            "the **same** interrupted session on the **same** commit.\n"
+            "  Never reuse an old run dir or report for a new calibration request."
+        )
+        return 2
+    if args.resume and plan_path.exists():
+        existing = json.loads(plan_path.read_text())
+        plan_stages = existing.get("stages") or sel
+        plan_repeats = existing.get("repeats", args.repeats)
+        cal_sha = _plan_calibration_sha(existing)
+        if cal_sha and gi["sha"] != cal_sha:
+            print(
+                "error: HEAD moved since this run dir was started.\n"
+                f"  calibration_git_sha: {cal_sha}\n"
+                f"  current HEAD:        {gi['sha']}\n"
+                "  Start a **new** --output-dir on the current commit; "
+                "do not --resume across commits."
+            )
+            return 2
+        if set(sel) - set(plan_stages):
+            print(
+                "error: --resume --stages must be a subset of the existing "
+                f"plan stages: {plan_stages}"
+            )
+            return 2
+        if args.repeats != plan_repeats:
+            print(
+                f"warning: --resume ignores --repeats {args.repeats}; "
+                f"using plan repeats={plan_repeats}"
+            )
+        if set(sel) != set(plan_stages):
+            print(
+                f"resume: executing subset {sel} within plan "
+                f"({len(plan_stages)} stages, repeats={plan_repeats})"
+            )
+        (out / "plan.json").write_text(json.dumps(dict(
+            model=existing.get("model", cfg["name"]),
+            stages=plan_stages,
+            repeats=plan_repeats,
+            timestamp=existing.get("timestamp", now_iso()),
+            calibration_started_at=existing.get(
+                "calibration_started_at", existing.get("timestamp", now_iso())),
+            calibration_git_sha=cal_sha or gi["sha"],
+            git_sha=cal_sha or gi["sha"],
+            git_branch=existing.get("git_branch", gi["branch"]),
+            dirty=gi["dirty"],
+            venv_python=existing.get("venv_python", py),
+            venv_source=existing.get("venv_source", src),
+            tune_version=existing.get("tune_version", __version__),
+            stages_yaml=existing.get("stages_yaml", str(sy)),
+            last_resume_at=now_iso(),
+            last_resume_git_sha=gi["sha"],
+        ), indent=2))
+        args.repeats = plan_repeats
+    else:
+        started = now_iso()
+        (out / "plan.json").write_text(json.dumps(dict(
+            model=cfg["name"], stages=sel, repeats=args.repeats,
+            timestamp=started,
+            calibration_started_at=started,
+            calibration_git_sha=gi["sha"],
+            git_sha=gi["sha"], git_branch=gi["branch"],
+            dirty=gi["dirty"], venv_python=py, venv_source=src,
+            tune_version=__version__, stages_yaml=str(sy)), indent=2))
     if gi["dirty"]:
         d = subprocess.run(["git", "diff", "HEAD"], cwd=REPO_ROOT,
                            capture_output=True, text=True, check=False).stdout
         (out / "workspace.diff").write_text(d)
-    # Group stages by test file so one pytest invocation covers all stages
-    # tied to that file (e.g. mmmu_accuracy + mmmu_speed come from a single
-    # `test_mmmu_accuracy_and_speed` function — run it once per repeat,
-    # extract both metric groups from the same result JSON).
+    # Group stages by test file and env so one pytest invocation covers all
+    # compatible stages tied to that file. Multi-preset TTS stages deliberately
+    # do not share a pytest invocation: `TTS_CI_MODEL=higgs` and
+    # `TTS_CI_MODEL=moss` must each run their own full observation.
     by_test = {}
     for sk in sel:
-        by_test.setdefault(all_stages[sk]["test"], []).append(sk)
+        stage = all_stages[sk]
+        key = (stage["test"], _stage_env_key(stage))
+        by_test.setdefault(key, []).append(sk)
     for sk in sel:
         (out / sk).mkdir(parents=True, exist_ok=True)
     max_passes = getattr(args, "max_passes", _DEFAULT_CALIBRATION_PASSES)
     max_gpus = max(
-        (gpus_per_test.get(Path(all_stages[s]["test"]).name, 2) for s in sel),
+        (_stage_gpus(all_stages[s], gpus_per_test) for s in sel),
         default=2,
     )
+    host = cfg.get("_host")
     for pass_num in range(1, max_passes + 1):
         ran_any = False
         for k in range(1, args.repeats + 1):
-            for test_path, stage_keys in by_test.items():
+            for (test_path, _env_key), stage_keys in by_test.items():
                 if all(_run_json_ok(out / sk / f"run{k}.json", all_stages[sk])
                        for sk in stage_keys):
                     if pass_num == 1 and args.resume:
@@ -1427,14 +2174,17 @@ def _run_cmd_inner(args, cfg, py, src, out):
                               f"skipped (complete, {len(stage_keys)} stage(s))")
                     continue
                 _purge_incomplete_run(out, stage_keys, all_stages, k)
-                needed = gpus_per_test.get(Path(test_path).name, 2)
+                needed = max(
+                    (_stage_gpus(all_stages[s], gpus_per_test) for s in stage_keys),
+                    default=2,
+                )
                 extra_args = (cfg.get("pytest_extra_args", {}) or {}).get(
                     Path(test_path).name, []) or []
                 if pass_num > 1:
                     print(f"=== calibration pass {pass_num}/{max_passes}: "
                           f"retry {Path(test_path).stem} run {k} ===")
                 if _run_shared(test_path, stage_keys, all_stages, out, k, py,
-                               args.repeats, needed, extra_args):
+                               args.repeats, needed, extra_args, host=host):
                     audit = audit_completeness(out, all_stages)
                     print(f"completeness at HALT: "
                           f"{audit['ok']}/{audit['total']} stage-runs complete")
@@ -1449,7 +2199,7 @@ def _run_cmd_inner(args, cfg, py, src, out):
             break
         if pass_num < max_passes:
             print(f"{audit['missing_count']} incomplete — GPU cleanup before next pass")
-            if not _ensure_gpus_free(max_gpus):
+            if not _ensure_gpus_free(max_gpus, host=host):
                 print("error: GPU memory not cleared; stopping calibration passes")
                 break
     audit = audit_completeness(out, all_stages)
@@ -1583,12 +2333,14 @@ def _print_run_banner(label, test_path, stage_keys, all_stages):
         print("  (docs smoke — no benchmark params, pass/fail only)")
 
 
-def _run_shared(test_path, stage_keys, all_stages, out, k, py, total, gpus_needed, extra_args=None):
+def _run_shared(test_path, stage_keys, all_stages, out, k, py, total, gpus_needed,
+                extra_args=None, host=None):
     """Run pytest once on test_path; write per-stage run{k}.json from
     the result JSONs written under the fresh pytest basetemp.
     """
     test_base = Path(test_path).stem
-    shared = out / "_pytest" / test_base
+    run_namespace = _run_namespace(test_path, stage_keys, all_stages)
+    shared = out / "_pytest" / run_namespace
     shared.mkdir(parents=True, exist_ok=True)
     log = shared / f"run{k}.log"
     basetemp = shared / f"basetemp_run{k}"
@@ -1629,13 +2381,22 @@ def _run_shared(test_path, stage_keys, all_stages, out, k, py, total, gpus_neede
     )
     env["NO_PROXY"] = merged
     env["no_proxy"] = merged
-    env.update(all_stages[stage_keys[0]].get("extra_env") or {})
-    label = f"[{test_base}] run {k}/{total} ({len(stage_keys)} stage(s), needs {gpus_needed} GPU)"
+    stage_env = _stage_env_key(all_stages[stage_keys[0]])
+    for sk in stage_keys[1:]:
+        if _stage_env_key(all_stages[sk]) != stage_env:
+            raise RuntimeError(
+                f"internal grouping error: {test_path} stages have different env"
+            )
+    env.update(dict(stage_env))
+    label = (
+        f"[{run_namespace}] run {k}/{total} "
+        f"({len(stage_keys)} stage(s), needs {gpus_needed} GPU)"
+    )
     _print_run_banner(label, test_path, stage_keys, all_stages)
     attempts, status, reason, dur, text, pytest_rc = 0, "ok", "", 0.0, "", 0
     while attempts < _MAX_RUN_ATTEMPTS:
         attempts += 1
-        picked, pick_err = _pick_gpus_for_launch(gpus_needed, label)
+        picked, pick_err = _pick_gpus_for_launch(gpus_needed, label, host)
         if picked is None:
             status, reason, dur = "failed", pick_err, 0.0
             print(f"{label} {pick_err}")
@@ -1643,7 +2404,7 @@ def _run_shared(test_path, stage_keys, all_stages, out, k, py, total, gpus_neede
         _cleanup_flashinfer_cache(env)
         shutil.rmtree(basetemp, ignore_errors=True)
         basetemp.mkdir(parents=True)
-        picked, gate_err = _launch_gpu_gate(picked, gpus_needed, label)
+        picked, gate_err = _launch_gpu_gate(picked, gpus_needed, label, host)
         if picked is None:
             status, reason, dur = "failed", gate_err or "launch GPU gate failed", 0.0
             print(f"{label} {reason}")
@@ -1670,7 +2431,7 @@ def _run_shared(test_path, stage_keys, all_stages, out, k, py, total, gpus_neede
             )
             pytest_rc = _wait_pytest_with_watchdog(pytest_proc, log, label)
         _cleanup_after_pytest(test_path, pytest_proc.pid, basetemp)
-        if not _ensure_gpus_free(gpus_needed):
+        if not _ensure_gpus_free(gpus_needed, host=host):
             status, reason, dur = "failed", "GPU memory not released after run", 0.0
             break
         dur = time.monotonic() - t0
@@ -1688,7 +2449,7 @@ def _run_shared(test_path, stage_keys, all_stages, out, k, py, total, gpus_neede
         if attempts < _MAX_RUN_ATTEMPTS and retryable:
             print(f"{label} {reason} — must clear GPU to <2 GiB before retry "
                   f"({attempts}/{_MAX_RUN_ATTEMPTS})")
-            if not _ensure_gpus_free(gpus_needed):
+            if not _ensure_gpus_free(gpus_needed, host=host):
                 status, reason = "failed", "GPU memory not released before retry"
                 break
             continue
@@ -1707,10 +2468,13 @@ def _run_shared(test_path, stage_keys, all_stages, out, k, py, total, gpus_neede
         sample_counts = _extract_counts(stage, basetemp)
         obs_status, obs_reason = _observation_status(
             stage, metrics, status, reason)
+        rec_gi = git_info()
         run_payload = dict(
             status=obs_status, reason=obs_reason, metrics=metrics,
             sample_counts=sample_counts,
             duration_s=round(dur, 2), attempts=attempts,
+            git_sha=rec_gi["sha"],
+            recorded_at=now_iso(),
             pytest_log=str(log.resolve()),
             basetemp=str(basetemp.resolve()))
         if stage.get("metrics"):
@@ -1722,6 +2486,17 @@ def _run_shared(test_path, stage_keys, all_stages, out, k, py, total, gpus_neede
         brief_parts = []
         if sample_counts.get("total") is not None or sample_counts.get("ok") is not None:
             brief_parts.append(f"samples={sample_counts.get('ok')}/{sample_counts.get('total')}")
+        expected = stage.get("expected_samples")
+        if (
+            expected is not None
+            and sample_counts.get("total") is not None
+            and sample_counts.get("total") != expected
+        ):
+            print(
+                f"  ⚠ {sk}: sample scope mismatch "
+                f"got {sample_counts.get('total')} expected {expected} "
+                f"(strict ✗ — purge and re-run on current branch)"
+            )
         brief_parts += [f"{k2}={_fmt(v, stage['metrics'][k2]['display'])}"
                         for k2, v in metrics.items() if v is not None]
         brief = " ".join(brief_parts)
@@ -1922,6 +2697,7 @@ def status_cmd(run_dir: Path):
               or stages_path(plan.get("model", DEFAULT_MODEL)))
     all_stages = _load_yaml(sy)
     audit = audit_completeness(run_dir, all_stages, plan)
+    strict = strict_audit(run_dir, all_stages, plan)
     mem = _gpu_memory_by_index()
     busy = sorted(busy_gpu_indices())
     ready, _, _ = _ready_gpu_indices(max(len(mem), 1))
@@ -1957,14 +2733,42 @@ def status_cmd(run_dir: Path):
         pytest_active=pytest_active,
         run_log_tail=log_tail,
         agent_poll_interval_s=_AGENT_POLL_INTERVAL_S,
+        strict_ready=f"{strict['strict_ready']}/{strict['total_stages']}",
+        strict_complete=strict["strict_complete"],
         timestamp=now_iso(),
     )
     print(json.dumps(out, indent=2))
-    return 0 if audit["complete"] else 1
+    return 0 if audit["complete"] and strict["strict_complete"] else 1
 
 
 def report(run_dir):
-    audit = audit_completeness(run_dir)
+    plan = json.loads((run_dir / "plan.json").read_text())
+    sy = Path(plan.get("stages_yaml") or stages_path(plan.get("model", DEFAULT_MODEL)))
+    all_stages = _load_yaml(sy)
+    git = audit_git_provenance(run_dir, plan)
+    if not git["ok"]:
+        print(f"error: refusing report — git provenance failed: {git['reason']}")
+        for item in git["mismatches"][:10]:
+            print(f"  {item}")
+        for item in git["missing_sha"][:10]:
+            print(f"  {item}")
+        return 1
+    strict = strict_audit(run_dir, all_stages, plan)
+    if not strict["strict_complete"]:
+        print(
+            f"error: refusing report — strict audit incomplete "
+            f"({strict['strict_ready']}/{strict['total_stages']} stages strict-ready)"
+        )
+        for row in strict["stages"]:
+            if row["strict_ok"] < plan["repeats"]:
+                exp = row["expected_samples"]
+                exp_note = f", expected={exp}" if exp is not None else ""
+                print(
+                    f"  {row['stage_key']}: {''.join(row['cells'])} "
+                    f"({row['strict_ok']}/{plan['repeats']}{exp_note})"
+                )
+        return 1
+    audit = audit_completeness(run_dir, all_stages, plan)
     if not audit["complete"]:
         print(f"error: refusing report — incomplete calibration "
               f"({audit['ok']}/{audit['total']})")
@@ -1977,7 +2781,18 @@ def report(run_dir):
     sy = Path(plan.get("stages_yaml") or stages_path(plan.get("model", DEFAULT_MODEL)))
     all_stages = _load_yaml(sy)
     N = plan["repeats"]
-    L = ["# CI Threshold Observation Report", ""]
+    cal_sha = _plan_calibration_sha(plan)
+    started = plan.get("calibration_started_at") or plan.get("timestamp", "?")
+    L = [
+        "# CI Threshold Observation Report",
+        "",
+        f"**Calibration commit:** `{cal_sha}`",
+        f"**Branch:** {plan.get('git_branch', '?')}",
+        f"**Run directory:** `{run_dir}`",
+        f"**Calibration started:** {started}",
+        f"**Report generated:** {now_iso()}",
+        "",
+    ]
     for idx, sk in enumerate(plan["stages"], start=1):
         s = all_stages[sk]
         L += [f"## {idx}. {s['title']}", "", f"{{{{CONTEXT:{sk}}}}}", ""]
@@ -2047,14 +2862,15 @@ def report(run_dir):
     v = pre.get("versions", {}) or {}
     L += ["## Provenance", "",
           f"- Model: {plan.get('model', '?')}",
-          f"- Branch: {plan.get('git_branch', '?')} "
-          f"@ {plan.get('git_sha', '?')[:8]}{dirty}{diff}",
+          f"- Calibration commit: `{cal_sha}`",
+          f"- Branch: {plan.get('git_branch', '?')}{dirty}{diff}",
+          f"- Calibration started: {started}",
           f"- Venv Python: {plan.get('venv_python', '?')} "
           f"({plan.get('venv_source', '?')})",
           f"- sglang {v.get('sglang', '?')} · torch {v.get('torch', '?')}",
           f"- GPU: {pre.get('gpu_summary', '?')}",
           f"- tune-ci-thresholds v{__version__}",
-          f"- Ran {plan.get('timestamp', '?')} – {now_iso()}"]
+          f"- Report generated: {now_iso()}"]
     (run_dir / "report.md").write_text("\n".join(L) + "\n")
     print(f"report written to {run_dir / 'report.md'}")
     return 0
@@ -2087,14 +2903,20 @@ def _read_concurrency(text):
 
 
 def _read_bare_value(text, symbol):
-    m = re.search(rf"^{re.escape(symbol)}\s*=\s*([+-]?\d+(?:\.\d+)?)\s*$",
-                  text, re.M)
-    return float(m.group(1)) if m else None
+    m = re.search(
+        rf"^{re.escape(symbol)}(?:\s*:\s*[^=]+)?\s*=\s*"
+        r"(None|[+-]?\d+(?:\.\d+)?)\s*$",
+        text,
+        re.M,
+    )
+    if not m or m.group(1) == "None":
+        return None
+    return float(m.group(1))
 
 
 def _read_nested_value(text, symbol, conc, subkey):
     m = re.search(rf"^{re.escape(symbol)}\s*=\s*\{{", text, re.M)
-    if not m or conc is None: return None
+    if not m: return None
     # Walk braces from the opening `{` to find the matching close.
     i, depth, end = m.end() - 1, 0, None
     while i < len(text):
@@ -2107,6 +2929,16 @@ def _read_nested_value(text, symbol, conc, subkey):
         i += 1
     if end is None: return None
     block = text[m.start():end]
+    if conc is None:
+        keys = sorted(
+            set(
+                int(k)
+                for k in re.findall(r"^\s*(\d+)\s*:\s*\{", block, re.M)
+            )
+        )
+        if len(keys) != 1:
+            return None
+        conc = keys[0]
     sub = re.search(rf"\b{conc}\s*:\s*\{{(.*?)\}}", block, re.S)
     if not sub: return None
     val = re.search(
@@ -2144,7 +2976,7 @@ def _apply_write_value(worst_op: str, worst_raw: float | None,
         return _ceil_wer_reference(worst_raw)
     if stage_group == "reliability":
         return math.ceil(worst_raw)
-    if stage_group in ("accuracy", "similarity", "utmos"):
+    if stage_group in ("accuracy", "diarization", "similarity", "utmos"):
         return worst_raw
     if worst_rounded is None:
         return worst_raw
@@ -2157,6 +2989,16 @@ def _apply_write_value(worst_op: str, worst_raw: float | None,
 
 def apply_plan(run_dir):
     plan = json.loads((run_dir / "plan.json").read_text())
+    git = audit_git_provenance(run_dir, plan)
+    if not git["ok"]:
+        print(json.dumps(dict(
+            error="git_provenance_failed",
+            reason=git["reason"],
+            calibration_git_sha=git["calibration_git_sha"],
+            mismatches=git["mismatches"][:20],
+            missing_sha=git["missing_sha"][:20],
+        ), indent=2))
+        return 1
     sy = Path(plan.get("stages_yaml")
               or stages_path(plan.get("model", DEFAULT_MODEL)))
     all_stages = _load_yaml(sy)
@@ -2168,15 +3010,26 @@ def apply_plan(run_dir):
         if not s["metrics"]:  # docs stage
             continue
         test_path = REPO_ROOT / s["test"]
-        text = test_path.read_text()
-        conc = _read_concurrency(text)
+        test_text = test_path.read_text()
+        threshold_path = REPO_ROOT / s.get("threshold_file", s["test"])
+        threshold_text = threshold_path.read_text()
+        conc = _read_concurrency(test_text) or _read_concurrency(threshold_text)
         per_run = []
         for k in range(1, N + 1):
             p = run_dir / sk / f"run{k}.json"
             per_run.append(json.loads(p.read_text()) if p.exists() else None)
-        sg = {"stage_key": sk, "test": str(test_path), "title": s["title"],
-              "stage_group": s.get("group"), "concurrency": conc,
-              "metrics": []}
+        sg = {
+            "stage_key": sk,
+            "test": str(test_path),
+            "threshold_file": str(threshold_path),
+            "title": s["title"],
+            "stage_group": s.get("group"),
+            "variant": s.get("variant"),
+            "calibration_preset": s.get("calibration_preset"),
+            "gpus": s.get("gpus"),
+            "concurrency": conc,
+            "metrics": [],
+        }
         for mk, m in s["metrics"].items():
             kind, sym, sub = _parse_source(m["source"])
             display = m.get("display", {})
@@ -2195,9 +3048,9 @@ def apply_plan(run_dir):
             write_value = _apply_write_value(
                 worst_op, worst, worst_rounded, s.get("group"))
             if kind == "bare":
-                cur = _read_bare_value(text, sym)
+                cur = _read_bare_value(threshold_text, sym)
             elif kind == "nested":
-                cur = _read_nested_value(text, sym, conc, sub)
+                cur = _read_nested_value(threshold_text, sym, conc, sub)
             else:
                 cur = None
             direction = _classify_direction(worst_op, cur, write_value)
@@ -2232,6 +3085,11 @@ def _bootstrap_from_host(host: dict | None) -> None:
     venv = host.get("venv_python")
     if venv and not os.environ.get("TUNE_VENV_PYTHON"):
         os.environ.setdefault("TUNE_VENV_PYTHON", str(venv))
+    if host.get("gpu_exclude") and not os.environ.get("TUNE_GPU_EXCLUDE"):
+        os.environ.setdefault(
+            "TUNE_GPU_EXCLUDE",
+            ",".join(str(i) for i in host["gpu_exclude"]),
+        )
 
 
 def main(argv=None):
@@ -2264,6 +3122,7 @@ def main(argv=None):
     sd = sub.add_parser("report"); sd.add_argument("--run-dir", required=True)
     se = sub.add_parser("apply-plan"); se.add_argument("--run-dir", required=True)
     sf = sub.add_parser("status"); sf.add_argument("--run-dir", required=True)
+    sg = sub.add_parser("strict-audit"); sg.add_argument("--run-dir", required=True)
     args = p.parse_args(argv)
     if args.cmd == "models-list":
         for m in available_models(): print(m)
@@ -2284,6 +3143,8 @@ def main(argv=None):
         return apply_plan(Path(args.run_dir))
     if args.cmd == "status":
         return status_cmd(Path(args.run_dir))
+    if args.cmd == "strict-audit":
+        return strict_audit_cmd(Path(args.run_dir))
     cfg = load_model_config(args.model, host=host)
     if args.cmd == "stages-list":
         return stages_list(cfg)

@@ -21,7 +21,11 @@ from sglang_omni.http.admin_auth import (
     resolve_admin_api_key,
 )
 from sglang_omni.http.favicon import register_favicon
-from sglang_omni_router.config import RouterConfig, WorkerConfig
+from sglang_omni_router.config import (
+    MIN_CONNECTIONS_PER_WORKER,
+    RouterConfig,
+    WorkerConfig,
+)
 from sglang_omni_router.health import HealthChecker
 from sglang_omni_router.proxy import ProxyHandler, filter_request_headers
 from sglang_omni_router.selector import WorkerSelector
@@ -37,6 +41,9 @@ logger = logging.getLogger(__name__)
 _ADMIN_UPDATE_PATHS = {
     "/pause_generation",
     "/update_weights_from_disk",
+    "/update_weights_from_distributed",
+    "/init_weights_update_group",
+    "/destroy_weights_update_group",
 }
 _ADMIN_UPDATE_LOCK_TIMEOUT_S = 300.0
 
@@ -193,6 +200,13 @@ def register_routes(
 
         worker = Worker(config=worker_config)
         workers.append(worker)
+        if config.max_connections < MIN_CONNECTIONS_PER_WORKER * len(workers):
+            logger.warning(
+                f"max_connections={config.max_connections} is below "
+                f"{MIN_CONNECTIONS_PER_WORKER} x {len(workers)} workers after "
+                "registration; the upstream client is sized at startup and can "
+                "under-feed the grown pool"
+            )
         await app.state.health_checker.check_worker_health(worker)
         logger.info(
             f"worker_registered worker={worker.display_id} url={worker.url} "
@@ -334,9 +348,29 @@ def register_routes(
     async def update_weights_from_tensor(request: Request) -> JSONResponse:
         return _not_implemented_response()
 
+    @app.post("/init_weights_update_group", dependencies=[Depends(_auth)])
+    async def init_weights_update_group(request: Request) -> JSONResponse:
+        return await _broadcast_admin_request(
+            app,
+            request,
+            "/init_weights_update_group",
+        )
+
+    @app.post("/destroy_weights_update_group", dependencies=[Depends(_auth)])
+    async def destroy_weights_update_group(request: Request) -> JSONResponse:
+        return await _broadcast_admin_request(
+            app,
+            request,
+            "/destroy_weights_update_group",
+        )
+
     @app.post("/update_weights_from_distributed", dependencies=[Depends(_auth)])
     async def update_weights_from_distributed(request: Request) -> JSONResponse:
-        return _not_implemented_response()
+        return await _broadcast_admin_request(
+            app,
+            request,
+            "/update_weights_from_distributed",
+        )
 
     @app.api_route(
         "/weights_checker",
@@ -345,6 +379,10 @@ def register_routes(
     )
     async def weights_checker(request: Request) -> JSONResponse:
         return await _broadcast_admin_request(app, request, "/weights_checker")
+
+    @app.post("/generate")
+    async def generate(request: Request) -> Response:
+        return await proxy.forward_model_request(request, "/generate")
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
@@ -411,6 +449,20 @@ async def _broadcast_admin_request(
     if not target_workers:
         return _error_response(503, "no live upstream workers")
 
+    # Note (Xuesong): distributed-init assigns each worker an NCCL rank from a
+    # single shared rank_offset (sglang: rank = rank_offset + tp_rank).
+    # Broadcasting the same body to multiple replicas makes them join with
+    # colliding ranks and hang the rendezvous. Reject until the trainer assigns
+    # a distinct rank_offset per replica (genuine multi-replica support is a
+    # larger design).
+    if path == "/init_weights_update_group" and len(target_workers) > 1:
+        return _error_response(
+            422,
+            "distributed weight-update init currently supports a single-replica "
+            f"target stage, but {len(target_workers)} live workers were targeted; "
+            "multi-replica refit needs a distinct rank_offset per replica.",
+        )
+
     if path in _ADMIN_UPDATE_PATHS:
         try:
             await asyncio.wait_for(
@@ -454,6 +506,7 @@ async def _broadcast_admin_request_locked(
     body = await request.body()
     headers = filter_request_headers(request)
     previous_disabled = {worker.worker_id: worker.disabled for worker in workers}
+    results: list[dict[str, Any]] | None = None
     if disable_targets:
         for worker in workers:
             worker.set_disabled(True)
@@ -473,8 +526,7 @@ async def _broadcast_admin_request_locked(
         )
     finally:
         if disable_targets:
-            for worker in workers:
-                worker.set_disabled(previous_disabled[worker.worker_id])
+            _restore_admin_disabled_state(path, workers, previous_disabled, results)
 
     success = all(item["success"] for item in results)
     if path == "/model_info":
@@ -488,6 +540,30 @@ async def _broadcast_admin_request_locked(
         "results": results,
     }
     return JSONResponse(payload, status_code=200 if success else 502)
+
+
+def _restore_admin_disabled_state(
+    path: str,
+    workers: list[Worker],
+    previous_disabled: dict[str, bool],
+    results: list[dict[str, Any]] | None,
+) -> None:
+    keep_disabled_urls: set[str] = set()
+    if path == "/init_weights_update_group":
+        if results is None:
+            keep_disabled_urls = {worker.url for worker in workers}
+        else:
+            keep_disabled_urls = {
+                str(item.get("worker"))
+                for item in results
+                if item.get("success") is not True
+            }
+
+    for worker in workers:
+        if worker.url in keep_disabled_urls:
+            worker.set_disabled(True)
+            continue
+        worker.set_disabled(previous_disabled[worker.worker_id])
 
 
 def _model_info_broadcast_response(

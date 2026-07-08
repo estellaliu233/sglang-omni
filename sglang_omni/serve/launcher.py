@@ -25,6 +25,7 @@ Export a config to JSON::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import socket
@@ -38,10 +39,12 @@ from pydantic import BaseModel
 
 from sglang_omni.client import Client
 from sglang_omni.config import PipelineConfig
+from sglang_omni.models.model_capabilities import get_model_capabilities
 from sglang_omni.pipeline.mp_runner import MultiProcessPipelineRunner
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.profiler.profiler_control import ProfilerControlClient
 from sglang_omni.serve.openai_api import create_app
+from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
 from sglang_omni.utils.gpu_compat import apply_gpu_compat_env_defaults
 from sglang_omni.utils.gpu_memory import (
     GpuDeviceInfo,
@@ -64,11 +67,11 @@ def _find_available_port(host: str, port: int) -> int:
             return port
     except OSError:
         pass
-    logger.warning("Port %d is already in use on %s.", port, host)
+    logger.warning(f"Port {port} is already in use on {host}.")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((host, 0))
         free_port = s.getsockname()[1]
-    logger.warning("Using port %d instead.", free_port)
+    logger.warning(f"Using port {free_port} instead.")
     return free_port
 
 
@@ -147,6 +150,38 @@ def _placement_log_summary(
             for gpu_id, gpu in placement_plan.gpus.items()
         },
     }
+
+
+def _model_capabilities_log_summary(
+    pipeline_config: PipelineConfig,
+) -> dict[str, Any] | None:
+    architecture = getattr(type(pipeline_config), "architecture", None)
+    if architecture is None:
+        return None
+    capabilities = get_model_capabilities(architecture)
+    if capabilities is None:
+        return None
+    return {
+        "architecture": architecture,
+        "reference_audio": capabilities.supports_reference_audio,
+        "batch_vocoder": capabilities.supports_batch_vocoder,
+        "streaming_vocoder": capabilities.supports_streaming_vocoder,
+        "cuda_graph": capabilities.supports_cuda_graph,
+        "torch_compile": capabilities.supports_torch_compile,
+    }
+
+
+def _log_model_capabilities(pipeline_config: PipelineConfig) -> None:
+    try:
+        summary = _model_capabilities_log_summary(pipeline_config)
+    except Exception:
+        logger.warning(
+            "Failed to resolve model capabilities for startup log",
+            exc_info=True,
+        )
+        return
+    if summary is not None:
+        logger.info("Model capabilities: %s", json.dumps(summary, sort_keys=True))
 
 
 class StartReq(BaseModel):
@@ -296,6 +331,7 @@ async def _run_server(
     enable_realtime: bool = False,
     allowed_local_media_path: str | None = None,
     allowed_media_domains: list[str] | None = None,
+    tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
 ) -> None:
     """Start the pipeline and run the OpenAI server.
 
@@ -321,9 +357,9 @@ async def _run_server(
         pipeline_config,
     )
     logger.info(
-        "Resolved placement/topology plan: placement=%s",
-        placement_summary,
+        f"Resolved placement/topology plan: placement={placement_summary}",
     )
+    _log_model_capabilities(pipeline_config)
     logger.info(
         "Pipeline '%s' started (%d GPU(s))",
         pipeline_config.name,
@@ -345,6 +381,8 @@ async def _run_server(
             enable_realtime=enable_realtime,
             allowed_local_media_path=allowed_local_media_path,
             allowed_media_domains=allowed_media_domains,
+            tts_batch_max_items=tts_batch_max_items,
+            architectures=[pipeline_config.architecture],
         )
         profiler_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
         profiler_ctl = ProfilerControlClient(mp_runner.stage_control_endpoints)
@@ -414,6 +452,7 @@ def launch_server(
     enable_realtime: bool = False,
     allowed_local_media_path: str | None = None,
     allowed_media_domains: list[str] | None = None,
+    tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
 ) -> None:
     """Blocking helper: start the pipeline and OpenAI-compatible server.
 
@@ -431,6 +470,8 @@ def launch_server(
         allowed_local_media_path: Directory allowed for ``file://`` media
             references in TTS requests.
         allowed_media_domains: Domains allowed for remote TTS reference audio.
+        tts_batch_max_items: Maximum items accepted by
+            ``/v1/audio/speech/batch``.
     """
     apply_gpu_compat_env_defaults()
     asyncio.run(
@@ -444,5 +485,6 @@ def launch_server(
             enable_realtime=enable_realtime,
             allowed_local_media_path=allowed_local_media_path,
             allowed_media_domains=allowed_media_domains,
+            tts_batch_max_items=tts_batch_max_items,
         )
     )

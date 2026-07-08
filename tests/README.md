@@ -7,10 +7,12 @@ tests/
 ├── data/
 ├── test_model/
 │   ├── conftest.py
+│   ├── test_rl_distributed_weight_update.py
 │   ├── test_qwen3_omni_*_ci.py
 │   ├── test_qwen3_omni_videoamme_talker_tp2_ci.py
 │   ├── test_tts_ci.py
-│   └── test_qwen3_asr_ci.py
+│   ├── test_asr_ci_multi_speaker.py
+│   └── test_asr_ci_seedtts.py
 └── unit_test/
     ├── benchmarks/
     │   └── test_dataset_regressions.py
@@ -18,6 +20,8 @@ tests/
     │   ├── fish_fakes.py
     │   ├── pipeline_fakes.py
     │   └── qwen_fakes.py
+    ├── utils/
+    │   └── test_audio.py
     ├── pipeline/
     │   ├── helpers.py
     │   ├── test_compile.py
@@ -32,6 +36,8 @@ tests/
     │   ├── test_stage.py
     │   ├── test_stage_process_env.py
     │   └── test_stage_streaming.py
+    ├── models/
+    │   └── test_model_capabilities.py
     ├── qwen3_omni/
     │   ├── test_cli.py
     │   ├── test_code2wav.py
@@ -61,6 +67,9 @@ tests/
     ├── qwen3_asr/
     │   ├── test_pipeline.py
     │   └── test_request_builders.py
+    ├── moss_transcribe_diarize/
+    │   ├── test_request_builders.py
+    │   └── test_transcription_adapter.py
     ├── qwen3_tts/
     │   └── test_pipeline.py
     ├── higgs_tts/
@@ -76,7 +85,8 @@ tests/
     │   ├── test_radix_hash.py
     │   ├── test_s0_gate.py
     │   ├── test_state_pool.py
-    │   └── test_streaming_vocoder.py
+    │   ├── test_streaming_vocoder.py
+    │   └── test_vocoder_decoder.py
     ├── router/
     │   ├── test_app.py
     │   └── test_core.py
@@ -85,7 +95,13 @@ tests/
     │   ├── test_stop_run_id.py
     │   └── test_views.py
     ├── serve/
+    │   ├── test_generation_batch_policy.py
+    │   ├── test_generation_server_args.py
     │   └── test_openai_api.py
+    ├── scheduling/
+    │   ├── test_engine_factory.py
+    │   ├── test_pipeline_state.py
+    │   └── test_reference_encoder.py
     ├── fishaudio_s2_pro/
     │   ├── test_pipeline.py
     │   ├── test_streaming_vocoder.py
@@ -147,16 +163,26 @@ pytest tests/test_model -m benchmark -v -s
 
 Relevant model CI ownership:
 
-- `qwen3_omni_thinker_server` / `qwen3_omni_talker_server`: expose the shared
-  router-backed Qwen3-Omni endpoint from `conftest.py`.
+- Qwen3-Omni server fixtures in `conftest.py` span the five viable 2xH100
+  serving topologies (one per stage type — see the H20->H100 migration PR):
+  `qwen3_omni_fp8_colocated_server` (FP8 colocated DP2),
+  `qwen3_omni_bf16_colocated_server` / `qwen3_omni_bf16_colocated_thinker_server`
+  (BF16 colocated DP2, full / thinker-only), `qwen3_omni_bf16_disagg_server`
+  (BF16 disaggregated), and `qwen3_omni_fp8_tp2_server` (FP8 thinker-TP=2);
+  BF16 thinker-TP=2 is exercised by thinker_length via `_start_qwen3_omni_tp2`.
 - `test_qwen3_omni_tts_ci.py`: gates the SeedTTS speed/WER path through the
   router at TTS generation concurrency 16 and verifies both colocated workers
   receive traffic. WER reuses saved audio after the Qwen3-Omni server is
   stopped, then transcribes through Qwen3-ASR at concurrency 32.
-- `test_qwen3_asr_ci.py`: Qwen3-ASR correctness + speed via SGLang Omni
-  router (`/v1/audio/transcriptions`). Uses the first 20 English SeedTTS
-  clips; writes `qwen3_asr_results.json` for threshold calibration
-  (`qwen3-asr-v1` in `tune-ci-thresholds`). Its stdout uses the same boxed
+- `test_asr_ci_multi_speaker.py`: MOSS-Transcribe-Diarize multi-speaker
+  ASR/diarization correctness + speed via the managed router at DP=2. It
+  reuses the movies800 benchmark path, writes
+  `moss_transcribe_diarize_results.json`, and enforces calibrated
+  accuracy/speed thresholds generated from `tune-ci-thresholds`.
+- `test_asr_ci_seedtts.py`: Qwen3-ASR correctness + speed via SGLang Omni
+  router (`/v1/audio/transcriptions`). Uses the full 1088-sample English
+  SeedTTS set; writes `qwen3_asr_results.json` for threshold calibration
+  (`asr` in `tune-ci-thresholds`). Its stdout uses the same boxed
   summary style as the other benchmark stages: `ASR WER Benchmark Result`
   followed by `ASR Speed Benchmark Result`.
 - `utils.py`: shared fixture/helpers for talker/TTS WER CI —
@@ -169,11 +195,12 @@ Relevant model CI ownership:
   GPUs, then transcribe saved WAVs through the ASR router. Qwen3-Omni
   talker/TTS generation concurrency is 16, including the
   `videoamme_talker_tp2` stage; ASR/WER transcription concurrency is 32.
-- CI env alignment on the H20 repro host: `source .github/scripts/ci_env.sh`
+- CI env alignment on the H100 repro host: `source .github/scripts/ci_env.sh`
   then `source omni/bin/activate`.
   Omni CI (`omni-ci.yaml`) runs benchmark suites sequentially after one shared
-  setup: TTS CI → Qwen3-Omni CI → PR Test (`test.yaml` unit tests). A failure in
-  an earlier suite does not skip later ones; only a failed setup blocks the chain.
+  setup: PR Test (`test.yaml` unit tests) → ASR CI → TTS CI → Qwen3-Omni CI. A
+  failure in an earlier suite does not skip later ones; only a failed setup
+  blocks the chain.
   Full WER sweep: `.github/scripts/run_all_wer_ci_aligned.sh` (milestones on
   stdout; details in `/tmp/wer_ci_qwen3.log` and `/tmp/wer_ci_tts.log`).
 - GPU handoff between stages: `.github/scripts/delete_gpu_process.sh --kill-orphans` (kills orphan
@@ -186,6 +213,12 @@ Relevant model CI ownership:
   with `--enable-realtime` and drives `/v1/realtime` through a real WebSocket
   client to cover text responses, server VAD transcription, and disconnect
   teardown.
+- `test_rl_distributed_weight_update.py`: launches a Higgs TTS worker on one GPU
+  and a rank-0 trainer subprocess on another GPU, initializes the distributed
+  weight-update group, broadcasts base-model body weights, verifies the
+  `tts_engine` checksum changes, destroys the update group, and checks the
+  server still serves audio. It is skipped unless two GPUs and the required
+  Higgs base checkpoint are already available in the Hugging Face cache.
 - CLI flags `--s2pro-stage {nonstream,stream,consistency,all}` and
   `--concurrency {1,2,4,8,16,all}`: scope an S2-Pro CI sweep without editing
   source.
@@ -255,12 +288,27 @@ that happened to contain an older version of the test.
   - scheduler callable contracts, including sync wrappers and callable objects
     that return awaitables.
 - `unit_test/benchmarks/`: Benchmark dataset/loading regression tests.
+- `unit_test/utils/`: Shared utility tests:
+  - audio loading helpers for data URIs, file URIs, HTTP URLs, timeout fallback,
+    and mono/channel preservation.
+- `unit_test/models/`: Model registry and cross-model contract tests:
+  - static TTS `ModelCapabilities` declarations, registry lookup, aliases, and
+    launcher startup logging.
+- `unit_test/scheduling/`: Shared scheduling-service unit tests:
+  - `ReferenceEncodeService` cache, same-key single-flight, timeout, failure,
+    and revalidation semantics.
 - `unit_test/qwen3_asr/`: Qwen3-ASR unit tests:
   - pipeline config and stage factory concurrency defaults
   - single-source audio token length formula used by both processor and
     request builder paths
   - token-level result adapter marker handling, avoiding decode/encode
     text round-trips for byte-level BPE output.
+- `unit_test/moss_transcribe_diarize/`: MOSS-Transcribe-Diarize unit tests:
+  - pipeline config and stage factory default routing/memory contracts
+  - request builder audio-source resolution, single-audio enforcement, audio
+    token padding, and default transcribe+diarize prompt injection
+  - verbose_json transcription adapter: architecture-based resolution, special
+    token stripping, and speaker/timestamp segment parsing with fallback.
 - `unit_test/qwen3_omni/` Qwen3-Omni unit tests:
 
   - public CLI/config behavior
@@ -341,7 +389,11 @@ that happened to contain an older version of the test.
   - chunked prefill feedback/journal suppression and postprocess alignment checks
   - synchronous frame-decode parity harness and S0 gate coverage
   - streaming vocoder session lifecycle, per-request chunk-threshold and
-    coalescing contracts, and decode-failure isolation.
+    coalescing contracts, decode-failure isolation, and non-streaming full-sequence
+    decode through the codec path
+  - MOSS-TTS Local vocoder decoder packing, local-causal FlashAttention window
+    equivalence, CUDA bf16 packed-vs-SDPA parity, zero-length handling, and
+    flash-unavailable fallback.
 
 - `unit_test/router/`: SGLang-Omni Router unit tests:
   - router CLI/config behavior
@@ -351,6 +403,7 @@ that happened to contain an older version of the test.
   - managed launcher command construction and cleanup.
 
 - `unit_test/serve/`: In-process serving API unit tests:
+  - generation-stage SGLang server-args role mapping and CLI override capability boundaries
   - OpenAI-compatible request/response behavior
   - streaming response framing and failure semantics.
 

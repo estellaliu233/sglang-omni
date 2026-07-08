@@ -14,8 +14,6 @@ into those positions. So request_builder must:
 
 from __future__ import annotations
 
-import hashlib
-import io
 import logging
 import time
 from dataclasses import dataclass
@@ -33,6 +31,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
+from sglang_omni.utils.audio import audio_fingerprint, audio_fingerprint_int, load_audio
 
 from .audio_lengths import qwen3_asr_num_audio_tokens
 
@@ -69,40 +68,16 @@ def _audio_source_from_payload(payload: StagePayload) -> Any:
     return inputs
 
 
-def load_audio(source: Any) -> np.ndarray:
-    import torchaudio
-
-    if isinstance(source, memoryview):
-        source = source.tobytes()
-    if isinstance(source, bytearray):
-        source = bytes(source)
-
-    if isinstance(source, bytes):
-        audio, sample_rate = torchaudio.load(io.BytesIO(source))
-    elif isinstance(source, str):
-        audio, sample_rate = torchaudio.load(source)
-    else:
-        raise ValueError(f"Unsupported Qwen3-ASR audio input: {type(source).__name__}")
-
-    if audio.ndim == 2 and audio.shape[0] > 1:
-        audio = audio.mean(dim=0, keepdim=True)
-    audio = audio.squeeze(0).to(torch.float32)
-    if sample_rate != _SAMPLE_RATE:
-        audio = torchaudio.functional.resample(audio, sample_rate, _SAMPLE_RATE)
-    return audio.cpu().numpy()
-
-
-def _audio_fingerprint(audio: np.ndarray) -> str:
-    contiguous = np.ascontiguousarray(audio, dtype=np.float32)
-    return hashlib.blake2b(contiguous.tobytes(), digest_size=16).hexdigest()
-
-
-def _audio_fingerprint_int(fingerprint: str) -> int:
-    return int(fingerprint[:16], 16)
+def _load_audio(source: Any) -> np.ndarray:
+    return load_audio(
+        source,
+        source_name="Qwen3-ASR",
+        target_sample_rate=_SAMPLE_RATE,
+    )
 
 
 def _decode_token_ids(
-    tokenizer: Any, token_ids: list[int], *, skip_special_tokens: bool
+    tokenizer: Any, token_ids: list[int], skip_special_tokens: bool
 ) -> str:
     try:
         return tokenizer.decode(
@@ -167,26 +142,35 @@ def make_qwen3_asr_scheduler_adapters(
 
     def request_builder(payload: StagePayload) -> Qwen3ASRRequestData:
         params = payload.request.params or {}
-        audio = load_audio(_audio_source_from_payload(payload))
+        audio = _load_audio(_audio_source_from_payload(payload))
         audio_duration_s = float(len(audio) / _SAMPLE_RATE)
-        fingerprint = _audio_fingerprint(audio)
+        fingerprint = audio_fingerprint(audio)
 
+        # note (Jeffro Qu): unlike Whisper's default 30s window, here we pad the mel to the clip's true length.
+        # WhisperFeatureExtractor defaults to padding="max_length", padding every clip to nb_max_frames=3000 (~30s),
+        # so a short clip pays the full 30s of mel FFT on silence.
+        # This is safe for Qwen3-ASR because its encoder is variable-length and keeps only the
+        # valid frames via feature_attention_mask; vanilla Whisper's fixed-length encoder would instead break on padding="longest" (see ref: transformers#26241).
+        # refs:
+        #  https://github.com/huggingface/transformers/blob/main/src/transformers/models/whisper/feature_extraction_whisper.py
+        #  https://github.com/huggingface/transformers/issues/26241
         extracted = feature_extractor(
             audio,
             sampling_rate=_SAMPLE_RATE,
             return_tensors="pt",
             return_attention_mask=True,
+            padding="longest",
+            truncation=True,
         )
-        features = extracted.input_features  # 128, 3000
+        features = extracted.input_features  # [128, true_frames] (<= 3000)
         feature_attention_mask = getattr(extracted, "attention_mask", None)
         if feature_attention_mask is None:
             # WhisperFeatureExtractor normally returns one; fall back to all-valid.
             feature_attention_mask = torch.ones(
                 (features.shape[0], features.shape[-1]), dtype=torch.long
             )
-        # Keep the full padded mel; the model's get_audio_feature uses the mask
-        # to select valid frames. Its no-mask branch transposes wrong, so the
-        # mask path must be taken.
+        # note (Jeffro Qu): get_audio_feature uses the mask to select valid
+        # frames; its no-mask branch transposes wrong, so the mask path must be taken.
         num_mel_frames = int(feature_attention_mask.sum().item())
         num_audio_tokens = int(qwen3_asr_num_audio_tokens(num_mel_frames))
         logger.debug(
@@ -202,7 +186,7 @@ def make_qwen3_asr_scheduler_adapters(
 
         audio_item = MultimodalDataItem(
             modality=Modality.AUDIO,
-            hash=_audio_fingerprint_int(fingerprint),
+            hash=audio_fingerprint_int(fingerprint),
             feature=features,
             model_specific_data={
                 "feature_attention_mask": feature_attention_mask,
@@ -283,7 +267,7 @@ def make_qwen3_asr_scheduler_adapters(
         # is not an identity transform for all whitespace/Unicode transcripts.
         raw = _decode_token_ids(tokenizer, output_ids, skip_special_tokens=False)
         logger.debug(
-            f"[qwen3-asr] n_out={len(output_ids)} ids={output_ids[:40]} " f"raw={raw!r}"
+            f"[qwen3-asr] n_out={len(output_ids)} ids={output_ids[:40]} raw={raw!r}"
         )
         asr_text_idx = _find_subsequence(output_ids, asr_text_token_ids)
         transcript_ids = (

@@ -6,11 +6,13 @@ from typing import Annotated, Literal, NoReturn
 import typer
 import yaml
 
-from sglang_omni.config import PipelineConfig
+from sglang_omni.config import PipelineConfig, StageConfig
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.preprocessing.resource_connector import (
     resolve_allowed_local_media_path,
 )
+from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
+from sglang_omni.utils.gpu_compat import should_disable_custom_all_reduce_for_gpus
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +24,14 @@ _ASYNC_DECODE_FACTORIES = frozenset(
     {
         "sglang_omni.models.higgs_tts.stages.create_sglang_tts_engine_executor",
         "sglang_omni.models.moss_tts_local.stages.create_sglang_tts_engine_executor",
+        "sglang_omni.models.qwen3_omni.stages."
+        "create_sglang_thinker_executor_from_config",
+        "sglang_omni.models.moss_transcribe_diarize.stages."
+        "create_sglang_moss_transcribe_diarize_executor",
     }
+)
+_ASYNC_DECODE_SUPPORTED_MODELS = (
+    "Higgs TTS, MOSS-TTS-Local, and MOSS-Transcribe-Diarize"
 )
 _QWEN_PARTIAL_START_TALKER_FACTORY = (
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config"
@@ -142,6 +151,8 @@ def _apply_stage_server_args_override(
     stage_name: str,
     updates: dict[str, object],
     reason: str,
+    supported_factories: frozenset[str] | None = None,
+    flag_name: str | None = None,
 ) -> None:
     matching_stages = _find_matching_stages(
         pipeline_config,
@@ -149,6 +160,12 @@ def _apply_stage_server_args_override(
         reason=reason,
     )
     for stage in matching_stages:
+        if supported_factories is not None and stage.factory not in supported_factories:
+            display_flag = flag_name or reason
+            raise typer.BadParameter(
+                f"{display_flag} does not support stage {stage.name!r} "
+                f"with factory {stage.factory!r}"
+            )
         factory_args = dict(stage.factory_args or {})
         overrides = dict(factory_args.get("server_args_overrides") or {})
         overrides.update(updates)
@@ -237,6 +254,12 @@ def _normalize_allowed_media_domains(values: list[str] | None) -> list[str]:
             part.strip().lower() for part in value.split(",") if part.strip()
         )
     return domains
+
+
+def _validate_tts_batch_max_items(value: int) -> int:
+    if value < 1:
+        raise typer.BadParameter("tts batch max items must be greater than 0")
+    return value
 
 
 def apply_mem_fraction_cli_overrides(
@@ -464,10 +487,51 @@ def _validate_colocated_gpu_override(
         )
 
 
+def _stage_tp_gpu_ids(stage: StageConfig) -> list[int]:
+    gpu = stage.gpu
+    if gpu is None:
+        return []
+    if isinstance(gpu, int):
+        return [gpu]
+    return [int(g) for g in gpu]
+
+
+def _gate_custom_all_reduce_on_topology(
+    stage: object,
+    updates: dict[str, object],
+    *,
+    gpu_ids: tuple[int, ...],
+    should_disable: bool,
+) -> dict[str, object]:
+    """Relax a TP ``disable_custom_all_reduce=True`` override on a P2P-capable topology.
+
+    The config-level overrides disable custom all-reduce for every TP thinker.
+    Custom (P2P/NVLink) all-reduce is faster than NCCL and safe when the TP GPUs
+    form a P2P mesh, so re-enable it when the caller's topology probe confirms one
+    (``should_disable`` is False); otherwise keep it disabled. SGLang still performs
+    its own communicator support checks during worker startup before using the
+    custom all-reduce path.
+    """
+    if updates.get("disable_custom_all_reduce") is not True or should_disable:
+        return updates
+    refined = dict(updates)
+    refined["disable_custom_all_reduce"] = False
+    logger.info(
+        "Enabling custom all-reduce for stage '%s': GPUs %s form a P2P mesh",
+        stage.name,
+        list(gpu_ids),
+    )
+    return refined
+
+
 def _apply_tensor_parallel_server_args_overrides(
     pipeline_config: PipelineConfig,
 ) -> None:
     config_cls = type(pipeline_config)
+    topology_gated_custom_ar_stages = (
+        config_cls.topology_gated_custom_all_reduce_stages()
+    )
+    topology_gated_custom_ar_cache: dict[tuple[int, ...], bool] = {}
     for stage in pipeline_config.stages:
         updates = config_cls.tensor_parallel_server_args_overrides(
             stage_name=stage.name,
@@ -475,6 +539,18 @@ def _apply_tensor_parallel_server_args_overrides(
         )
         if not updates:
             continue
+        if stage.name in topology_gated_custom_ar_stages:
+            gpu_ids = tuple(_stage_tp_gpu_ids(stage))
+            if gpu_ids not in topology_gated_custom_ar_cache:
+                topology_gated_custom_ar_cache[gpu_ids] = (
+                    should_disable_custom_all_reduce_for_gpus(gpu_ids)
+                )
+            updates = _gate_custom_all_reduce_on_topology(
+                stage,
+                updates,
+                gpu_ids=gpu_ids,
+                should_disable=topology_gated_custom_ar_cache[gpu_ids],
+            )
         _apply_stage_server_args_override(
             pipeline_config,
             stage_name=stage.name,
@@ -710,38 +786,26 @@ def apply_partial_start_cli_overrides(
                 "--talker-partial-start currently supports only Qwen3-Omni "
                 f"talker; stage {stage.name!r} uses factory {stage.factory!r}"
             )
-    _apply_stage_factory_args_override(
+    _apply_factory_args_updates(
         pipeline_config,
-        stage_name=stage_name,
-        updates={"enable_partial_start": mode == "on"},
-        reason=f"talker partial-start mode to {mode!r}",
-        flag_name="--talker-partial-start",
+        matching_stages,
+        {"enable_partial_start": mode == "on"},
     )
     return pipeline_config
 
 
-def _apply_stage_factory_args_override(
+def _apply_factory_args_updates(
     pipeline_config: PipelineConfig,
-    *,
-    stage_name: str,
+    stages: list[StageConfig],
     updates: dict[str, object],
-    reason: str,
-    supported_factories: frozenset[str] | None = None,
-    flag_name: str | None = None,
 ) -> None:
-    matching_stages = _find_matching_stages(
-        pipeline_config,
-        stage_name=stage_name,
-        reason=reason,
-    )
-    for stage in matching_stages:
-        if supported_factories is not None and stage.factory not in supported_factories:
-            display_flag = flag_name or reason
-            raise typer.BadParameter(
-                f"{display_flag} currently supports only Higgs TTS and "
-                f"MOSS-TTS-Local; stage {stage.name!r} uses factory "
-                f"{stage.factory!r}"
-            )
+    """Apply factory_args + runtime_overrides updates to the given stages.
+
+    Callers compute their own matching stages (by stage_name for partial-start,
+    by factory for decode-mode) and pass them in; the update logic lives here
+    once so a signature change can't miss a copy.
+    """
+    for stage in stages:
         factory_args = dict(stage.factory_args or {})
         factory_args.update(updates)
         stage.factory_args = factory_args
@@ -773,14 +837,18 @@ def apply_decode_mode_cli_overrides(
         updates["async_decode_min_batch_size"] = int(async_lookahead_min_batch_size)
     if not updates:
         return pipeline_config
-    _apply_stage_factory_args_override(
-        pipeline_config,
-        stage_name="tts_engine",
-        updates=updates,
-        reason="decode mode override",
-        supported_factories=_ASYNC_DECODE_FACTORIES,
-        flag_name="--decode-mode/--async-lookahead-min-batch-size",
-    )
+    matching_stages = [
+        stage
+        for stage in pipeline_config.stages
+        if stage.factory in _ASYNC_DECODE_FACTORIES
+    ]
+    if not matching_stages:
+        raise typer.BadParameter(
+            "--decode-mode/--async-lookahead-min-batch-size currently supports "
+            f"only {_ASYNC_DECODE_SUPPORTED_MODELS}; no stage in this pipeline "
+            "uses a supported factory"
+        )
+    _apply_factory_args_updates(pipeline_config, matching_stages, updates)
     return pipeline_config
 
 
@@ -875,11 +943,18 @@ def serve(
             "--allowed_media_domain",
             help=(
                 "Restrict remote media references to this domain. Repeat the "
-                "flag to allow multiple domains. Remote HTTP(S) references "
-                "are disabled when this is omitted."
+                "flag to allow multiple domains. When omitted, remote HTTP(S) "
+                "references from any public host are allowed."
             ),
         ),
     ] = None,
+    tts_batch_max_items: Annotated[
+        int,
+        typer.Option(
+            "--tts-batch-max-items",
+            help="Maximum number of items accepted by /v1/audio/speech/batch.",
+        ),
+    ] = DEFAULT_TTS_BATCH_MAX_ITEMS,
     mem_fraction_static: Annotated[
         float | None,
         typer.Option(
@@ -1068,12 +1143,12 @@ def serve(
             "--decode-mode",
             "--decode_mode",
             help=(
-                "Decode execution mode for the tts_engine stage: "
+                "Decode execution mode for the supported generation stage: "
                 "async|sync. Omit this flag to use the pipeline config default "
                 "(async for Higgs TTS). Async mode enables one-step lookahead, "
                 "which can overlap the previous step's host-side collect with "
-                "the next GPU forward. Available for Higgs TTS and "
-                "MOSS-TTS-Local."
+                "the next GPU forward. Available for Higgs TTS, MOSS-TTS-Local, "
+                "and MOSS-Transcribe-Diarize."
             ),
         ),
     ] = None,
@@ -1085,6 +1160,30 @@ def serve(
             help=(
                 "Decode batches smaller than this bypass async lookahead and "
                 "run synchronously (fast path). Default 2."
+            ),
+        ),
+    ] = None,
+    max_running_requests: Annotated[
+        int | None,
+        typer.Option(
+            "--max-running-requests",
+            "--max_running_requests",
+            min=1,
+            help=(
+                "Override SGLang generation stage max_running_requests. "
+                "Omit to use the pipeline config default."
+            ),
+        ),
+    ] = None,
+    cuda_graph_max_bs: Annotated[
+        int | None,
+        typer.Option(
+            "--cuda-graph-max-bs",
+            "--cuda_graph_max_bs",
+            min=1,
+            help=(
+                "Override SGLang generation stage cuda_graph_max_bs. Omit "
+                "to use the pipeline config default."
             ),
         ),
     ] = None,
@@ -1164,6 +1263,26 @@ def serve(
         decode_mode=decode_mode,
         async_lookahead_min_batch_size=async_lookahead_min_batch_size,
     )
+    generation_server_args_overrides: dict[str, object] = {}
+    if max_running_requests is not None:
+        generation_server_args_overrides["max_running_requests"] = max_running_requests
+    if cuda_graph_max_bs is not None:
+        generation_server_args_overrides["cuda_graph_max_bs"] = cuda_graph_max_bs
+    if generation_server_args_overrides:
+        generation_stage_name = (
+            type(merged_config).generation_sglang_role_to_stage().get("generation")
+        )
+        if generation_stage_name is None:
+            _raise_unsupported_flag(
+                merged_config,
+                "--max-running-requests/--cuda-graph-max-bs",
+            )
+        _apply_stage_server_args_override(
+            merged_config,
+            stage_name=generation_stage_name,
+            updates=generation_server_args_overrides,
+            reason="SGLang generation server args override",
+        )
     merged_config = apply_partial_start_cli_overrides(
         merged_config,
         talker_partial_start=talker_partial_start,
@@ -1183,4 +1302,5 @@ def serve(
             allowed_local_media_path
         ),
         allowed_media_domains=_normalize_allowed_media_domains(allowed_media_domain),
+        tts_batch_max_items=_validate_tts_batch_max_items(tts_batch_max_items),
     )

@@ -30,6 +30,7 @@ _ARCH_CONFIG_MAP: dict[str, tuple[str, str | None]] = {
     "Qwen3TTSTalker": ("talker_config", None),
     "MossTTSDelaySGLangModel": ("language_config", None),
     "MossTTSLocalSGLangModel": ("language_config", None),
+    "MossTranscribeDiarizeForConditionalGeneration": ("text_config", None),
 }
 
 
@@ -222,11 +223,11 @@ class ModelWorker:
 
     def model_info(self) -> dict[str, Any]:
         return {
-            "model_path": getattr(self.server_args, "model_path", None),
-            "load_format": getattr(self.server_args, "load_format", None),
-            "weight_version": getattr(self.server_args, "weight_version", None),
+            "model_path": self.server_args.model_path,
+            "load_format": self.server_args.load_format,
+            "weight_version": self.server_args.weight_version,
             "tp_rank": self.tp_rank,
-            "tp_size": getattr(self.server_args, "tp_size", 1),
+            "tp_size": self.server_args.tp_size,
             "model_arch_override": self.model_arch_override,
             "supports_weight_update": hasattr(
                 self.model_runner, "update_weights_from_disk"
@@ -241,9 +242,7 @@ class ModelWorker:
         update = getattr(self.model_runner, "update_weights_from_disk", None)
         if update is None:
             return False, "model runner does not support update_weights_from_disk"
-        load_format = payload.get("load_format") or getattr(
-            self.server_args, "load_format", None
-        )
+        load_format = payload.get("load_format") or self.server_args.load_format
         success, message = update(
             model_path,
             load_format,
@@ -276,12 +275,77 @@ class ModelWorker:
             )
         return self._call_optional_weight_method("update_weights_from_tensor", payload)
 
+    def init_weights_update_group(self, payload: dict[str, Any]) -> tuple[bool, str]:
+        init = getattr(self.model_runner, "init_weights_update_group", None)
+        if init is None:
+            return False, "model runner does not support init_weights_update_group"
+        master_address = payload.get("master_address")
+        master_port = payload.get("master_port")
+        world_size = payload.get("world_size")
+        if not master_address or master_port is None or world_size is None:
+            return False, "master_address, master_port and world_size are required"
+        try:
+            master_port_int = int(master_port)
+            rank_offset_int = int(payload.get("rank_offset", 0))
+            world_size_int = int(world_size)
+        except (TypeError, ValueError):
+            return False, "master_port, rank_offset and world_size must be integers"
+        success, message = init(
+            master_address,
+            master_port_int,
+            rank_offset_int,
+            world_size_int,
+            payload.get("group_name") or "weight_update_group",
+            backend=payload.get("backend") or "nccl",
+        )
+        return bool(success), str(message)
+
+    def destroy_weights_update_group(self, payload: dict[str, Any]) -> tuple[bool, str]:
+        destroy = getattr(self.model_runner, "destroy_weights_update_group", None)
+        if destroy is None:
+            return False, "model runner does not support destroy_weights_update_group"
+        success, message = destroy(payload.get("group_name") or "weight_update_group")
+        return bool(success), str(message)
+
     def update_weights_from_distributed(
         self, payload: dict[str, Any]
     ) -> tuple[bool, str]:
-        return self._call_optional_weight_method(
-            "update_weights_from_distributed", payload
+        update = getattr(self.model_runner, "update_weights_from_distributed", None)
+        if update is None:
+            return (
+                False,
+                "model runner does not support update_weights_from_distributed",
+            )
+        names = payload.get("names")
+        dtypes = payload.get("dtypes")
+        shapes = payload.get("shapes")
+        if names is None or dtypes is None or shapes is None:
+            return False, "names, dtypes and shapes are required"
+        # Pydantic already guards type/None at the HTTP boundary; this length
+        # check is the one guard that matters — sglang zips names/dtypes/shapes
+        # and silently truncates to the shortest, under-broadcasting weights.
+        name_count = len(names)
+        dtype_count = len(dtypes)
+        shape_count = len(shapes)
+        if name_count == 0 or dtype_count == 0 or shape_count == 0:
+            return False, "names, dtypes and shapes must be non-empty"
+        if name_count != dtype_count or name_count != shape_count:
+            return False, "names, dtypes and shapes must have the same length"
+        success, message = update(
+            names,
+            dtypes,
+            shapes,
+            payload.get("group_name") or "weight_update_group",
+            load_format=payload.get("load_format"),
         )
+        if success:
+            weight_version = payload.get("weight_version")
+            if weight_version is not None:
+                setattr(self.server_args, "weight_version", weight_version)
+                runner_args = getattr(self.model_runner, "server_args", None)
+                if runner_args is not None:
+                    setattr(runner_args, "weight_version", weight_version)
+        return bool(success), str(message)
 
     def weights_checker(self, action: str) -> dict[str, Any]:
         checker = getattr(self, "_strict_weight_checker", None)
@@ -335,18 +399,16 @@ def _apply_model_worker_backend_policy(
     effective_quantization = _normalize_quantization(
         getattr(model_config, "quantization", None)
     )
-    server_quantization = _normalize_quantization(
-        getattr(server_args, "quantization", None)
-    )
+    server_quantization = _normalize_quantization(server_args.quantization)
     if server_quantization is not None:
         effective_quantization = server_quantization
 
-    moe_runner_backend = getattr(server_args, "moe_runner_backend", "auto")
+    moe_runner_backend = server_args.moe_runner_backend
     is_qwen3_omni_arch = model_arch_override in (
         "Qwen3OmniTalker",
         "Qwen3OmniThinkerForCausalLM",
     )
-    if is_qwen3_omni_arch and getattr(server_args, "ep_size", 1) != 1:
+    if is_qwen3_omni_arch and server_args.ep_size != 1:
         raise ValueError(
             "Qwen3-Omni ModelWorker does not support expert parallelism; "
             "use ep_size=1."
@@ -412,7 +474,7 @@ def _apply_model_worker_backend_policy(
         server_args.fp8_gemm_runner_backend = "triton"
         fp8_gemm_backend = server_args.fp8_gemm_runner_backend
 
-    server_quantization = getattr(server_args, "quantization", None)
+    server_quantization = server_args.quantization
     logger.info(
         f"Configured SGLang backend policy: arch={model_arch_override} "
         f"effective_quantization={effective_quantization} "

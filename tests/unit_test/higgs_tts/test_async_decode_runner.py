@@ -56,6 +56,8 @@ def _build_runner(
     runner._async_enabled = async_enabled
     runner._staging_slot = 0
     runner._host_staging_buffers = []
+    runner._logprob_host_buffers = None
+    runner._logprob_slot = 0
     runner._async_query_hit = 0
     runner._async_query_miss = 0
     runner.model = SimpleNamespace(
@@ -64,6 +66,7 @@ def _build_runner(
         _cg_active_eoc_countdown=torch.zeros(n, dtype=torch.int32),
         _cg_active_generation_done=torch.tensor(active_generation_done),
         _cg_active_last_codes=torch.zeros((n, n_codebooks), dtype=torch.long),
+        _cg_active_step_count=torch.zeros(n, dtype=torch.long),
         _cg_was_done=torch.tensor(was_done),
         _cg_codes_BN=torch.tensor(codes_BN),
         _cg_collect_staging=torch.zeros((n, n_codebooks + 2), dtype=torch.long),
@@ -72,6 +75,7 @@ def _build_runner(
             eoc_countdown=torch.zeros(n, dtype=torch.int32),
             generation_done=torch.zeros(n, dtype=torch.bool),
             last_codes=torch.zeros((n, n_codebooks), dtype=torch.long),
+            step_count=torch.zeros(n, dtype=torch.long),
         ),
     )
     reqs = [
@@ -81,7 +85,14 @@ def _build_runner(
         for i in range(n)
     ]
     datas = [
-        SimpleNamespace(req=reqs[i], output_codes=[], generation_done=False)
+        SimpleNamespace(
+            req=reqs[i],
+            output_codes=[],
+            output_logprobs=[],
+            return_omni_rollout=False,
+            return_logprob=False,
+            generation_done=False,
+        )
         for i in range(n)
     ]
     sched = [SimpleNamespace(request_id=f"req{i}", data=datas[i]) for i in range(n)]
@@ -124,9 +135,7 @@ def _patch_cpu_host_staging(monkeypatch):
     monkeypatch.setattr(
         HiggsTTSModelRunner,
         "_next_host_staging",
-        lambda self, device_staging: torch.empty(
-            device_staging.shape, dtype=device_staging.dtype, device="cpu"
-        ),
+        lambda self, shape, dtype: torch.empty(tuple(shape), dtype=dtype, device="cpu"),
     )
 
 
@@ -280,6 +289,8 @@ def test_async_real_pinned_path_matches_sync():
         runner._async_enabled = async_enabled
         runner._staging_slot = 0
         runner._host_staging_buffers = []
+        runner._logprob_host_buffers = None
+        runner._logprob_slot = 0
         runner._async_query_hit = 0
         runner._async_query_miss = 0
         runner.model = SimpleNamespace(
@@ -290,6 +301,7 @@ def test_async_real_pinned_path_matches_sync():
                 [False, True, False, True], device=dev
             ),
             _cg_active_last_codes=torch.zeros((n, 3), dtype=torch.long, device=dev),
+            _cg_active_step_count=torch.zeros(n, dtype=torch.long, device=dev),
             _cg_was_done=torch.tensor([False, True, False, False], device=dev),
             _cg_codes_BN=torch.tensor(
                 [[1, 1, 1], [7, 8, 9], [20, 1, 2], [EOC_ID, 3, 4]], device=dev
@@ -300,6 +312,7 @@ def test_async_real_pinned_path_matches_sync():
                 eoc_countdown=torch.zeros(n, dtype=torch.int32, device=dev),
                 generation_done=torch.zeros(n, dtype=torch.bool, device=dev),
                 last_codes=torch.zeros((n, 3), dtype=torch.long, device=dev),
+                step_count=torch.zeros(n, dtype=torch.long, device=dev),
             ),
         )
         reqs = [
@@ -307,7 +320,14 @@ def test_async_real_pinned_path_matches_sync():
             for c in (1, 0, 0, 0)
         ]
         datas = [
-            SimpleNamespace(req=reqs[i], output_codes=[], generation_done=False)
+            SimpleNamespace(
+                req=reqs[i],
+                output_codes=[],
+                output_logprobs=[],
+                return_omni_rollout=False,
+                return_logprob=False,
+                generation_done=False,
+            )
             for i in range(n)
         ]
         sched = [SimpleNamespace(request_id=f"req{i}", data=datas[i]) for i in range(n)]

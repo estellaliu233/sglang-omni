@@ -12,9 +12,33 @@ from typing import Any
 
 import torch
 
-from sglang_omni.scheduling.types import ModelRunnerOutput, RequestOutput
+from sglang_omni.sampling.seed import (
+    SAMPLING_SEED_MASK,
+    derive_sampling_seed,
+    resolve_row_seed,
+)
+from sglang_omni.scheduling.types import (
+    ModelRunnerOutput,
+    RequestOutput,
+    SchedulerRequest,
+    sampled_logprobs_to_list,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _current_sglang_sampling_backend() -> str | None:
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        return get_global_server_args().sampling_backend
+    except ValueError:
+        return None
+
+
+def _rank_shared_unseeded_sampling_seed(request: SchedulerRequest, row_idx: int) -> int:
+    request_id = request.request_id or f"row-{row_idx}"
+    return derive_sampling_seed("sglang-omni-unseeded-row", request_id)
 
 
 @dataclass
@@ -43,7 +67,6 @@ class _PendingStep:
     schedule_batch: Any  # to set .output_ids during resolve
     model_worker_batch: Any  # for the prefill-only finalize branch (unused in decode)
     batch_result: Any  # carries logits_output (device of next_token_ids)
-    n_real: int  # number of real (non-padding) rows this step
 
 
 class ModelRunner:
@@ -72,29 +95,36 @@ class ModelRunner:
         self._async_query_hit: int = 0
         self._async_query_miss: int = 0
 
-    def _next_host_staging(self, device_staging: torch.Tensor) -> torch.Tensor:
-        """Return a pinned host staging buffer mirroring ``device_staging``'s
-        full shape, ping-ponging between two buffers on each call. Only runners
-        that stage the collect to host (Higgs) call this; device-snapshot
-        runners (MOSS-TTS-Local) never do.
+    def _next_host_staging(
+        self, shape: tuple[int, ...] | torch.Size, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Return a pinned host staging buffer covering ``shape``/``dtype``,
+        ping-ponging between two buffers on each call. Runners that stage the
+        collect to host use this: Higgs passes its fixed CG staging shape, the
+        base plain-LM launch passes the step's ``(batch_size,)`` ids shape.
+        Device-snapshot runners (MOSS-TTS-Local) never do.
 
         Two buffers are required: resolve(N) reads one on the host while
         launch(N+1)'s async host copy writes the other. That CPU-read vs
         GPU-write overlap is not protected by single-stream ordering.
-        Buffers are allocated lazily on first use (the base runner does not
-        know the model-specific staging shape at construction time).
+        Buffers are allocated lazily on first use and replaced when the
+        requested dim 0 outgrows them (or trailing dims / dtype change); a
+        resolve still holding the previous buffer keeps it alive, so
+        replacement cannot alias an in-flight snapshot.
         """
-        if not self._host_staging_buffers:
-            self._host_staging_buffers = [
-                torch.empty(
-                    device_staging.shape,
-                    dtype=device_staging.dtype,
-                    device="cpu",
-                    pin_memory=True,
-                )
+        bufs = self._host_staging_buffers
+        if (
+            not bufs
+            or bufs[0].dtype != dtype
+            or bufs[0].shape[1:] != tuple(shape[1:])
+            or bufs[0].shape[0] < shape[0]
+        ):
+            self._host_staging_buffers = bufs = [
+                torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
                 for _ in range(2)
             ]
-        buf = self._host_staging_buffers[self._staging_slot]
+            self._staging_slot = 0
+        buf = bufs[self._staging_slot]
         self._staging_slot ^= 1
         return buf
 
@@ -181,7 +211,6 @@ class ModelRunner:
             schedule_batch=schedule_batch,
             model_worker_batch=model_worker_batch,
             batch_result=batch_result,
-            n_real=len(scheduler_output.requests),
         )
 
     def execute_resolve(
@@ -206,8 +235,7 @@ class ModelRunner:
         skip_rids = {
             req.request_id
             for req in pending.scheduler_output.requests
-            if req.data.req.finished()
-            or bool(getattr(req.data.req, "is_retracted", False))
+            if req.data.req.finished() or self._req_is_retracted(req.data.req)
         }
         self.post_decode_resolve(
             pending.launch_buf,
@@ -456,12 +484,23 @@ class ModelRunner:
     def lookahead_eligible(self, batch: Any) -> bool:
         """Whether this batch may use one-step async-decode lookahead.
 
-        Default True. A runner whose collect has a sync-only fallback (one that
-        would diverge from sync under a one-step lag) overrides this to route
-        those batches synchronously. The scheduler's async gate consults it.
+        The default launch samples one step before resolve appends the previous
+        token to ``req.output_ids`` / the sglang penalizer state, so any sampling
+        term scored by output history (repetition / frequency / presence penalty,
+        ``min_new_tokens``) would read a one-token-stale view and diverge from
+        sync — gate those batches to sync. Over-gating only costs throughput,
+        under-gating is a silent divergence. Runners override for other fallbacks.
         """
-        del batch
-        return True
+
+        def _history_free(sp: Any) -> bool:
+            return (
+                sp.repetition_penalty == 1.0
+                and sp.frequency_penalty == 0.0
+                and sp.presence_penalty == 0.0
+                and sp.min_new_tokens == 0
+            )
+
+        return all(_history_free(req.sampling_params) for req in batch.reqs)
 
     def post_process_outputs(
         self,
@@ -474,22 +513,26 @@ class ModelRunner:
     def post_decode_launch(
         self, result: Any, forward_batch: Any, requests: list
     ) -> Any:
-        """Async-decode GPU half of ``post_decode``: run the step's collect,
-        publish ``result.next_token_ids``, and return the resolve payload
-        (``launch_buf``), either a device-side correctness snapshot of the
-        published state (no host copy) or a pinned host staging buffer an async
-        host copy filled; only the latter provides host-D2H overlap. The caller
-        records a CUDA event immediately after publication.
+        """Async-decode GPU half of ``post_decode``: sample now, publish
+        ``result.next_token_ids``, and return the resolve payload (``launch_buf``);
+        the caller records a CUDA event right after.
 
-        Default raises: a model must implement this together with
-        ``post_decode_resolve`` to be async-decode-safe. The synchronous
-        ``post_decode`` reads live GPU buffers that the next launch would
-        overwrite, so it cannot simply be deferred (design.md §1.6).
+        Default (plain-LM): sample via ``_sample_next_token_ids`` and snapshot the
+        ids into a pinned ping-pong host buffer (required — the sampler output can
+        alias step-reused buffers the next launch overwrites). Codec runners whose
+        collect is more than next_token_ids override this with ``post_decode_resolve``.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support async decode: implement "
-            "post_decode_launch / post_decode_resolve"
-        )
+        if not requests:
+            return None
+        if result.next_token_ids is None:
+            result.next_token_ids = self._sample_next_token_ids(
+                result.logits_output, forward_batch, None, requests
+            )
+        n = len(requests)
+        ids = result.next_token_ids
+        host_buf = self._next_host_staging((n,), ids.dtype)
+        host_buf[:n].copy_(ids[:n], non_blocking=True)
+        return host_buf
 
     def post_decode_resolve(
         self,
@@ -499,15 +542,15 @@ class ModelRunner:
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        """Async-decode host half of ``post_decode``: read ``launch_buf`` (the
-        launch's published collect, a device snapshot or pinned host staging)
-        and run the per-request collect loop, setting ``result.next_token_ids``.
-        Default raises (see ``post_decode_launch``).
+        """Async-decode host half of ``post_decode``: read ``launch_buf`` and set
+        ``result.next_token_ids``. Default (plain-LM): point it at the pinned host
+        snapshot — the caller already waited on the launch event, so ``_finalize``
+        reads it without a GPU sync.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support async decode: implement "
-            "post_decode_launch / post_decode_resolve"
-        )
+        del forward_batch, schedule_batch
+        if launch_buf is None or not requests:
+            return
+        result.next_token_ids = launch_buf[: len(requests)]
 
     def sample_before_post_prefill(
         self, forward_batch: Any, schedule_batch: Any, requests: list
@@ -542,7 +585,139 @@ class ModelRunner:
     ) -> Any:
         self._apply_repetition_penalty(logits_output, requests)
         self._apply_codec_suppress_tokens(logits_output, requests)
-        return self.tp_worker.model_runner.sample(logits_output, forward_batch)
+        self._install_sampling_seeds(forward_batch, requests)
+        wants_rollout_logprob = any(sr.data.return_logprob for sr in requests)
+        if wants_rollout_logprob:
+            self._enable_sampler_logprobs(forward_batch, len(requests))
+        next_token_ids = self.tp_worker.model_runner.sample(
+            logits_output, forward_batch
+        )
+        if wants_rollout_logprob:
+            try:
+                next_token_logprobs = logits_output.next_token_logprobs
+            except AttributeError as exc:
+                raise RuntimeError(
+                    "Sampler did not populate next_token_logprobs when "
+                    "return_logprob is enabled"
+                ) from exc
+            if next_token_logprobs is None:
+                raise RuntimeError(
+                    "Sampler did not populate next_token_logprobs when "
+                    "return_logprob is enabled"
+                )
+            self._record_rollout_logprobs(
+                next_token_logprobs,
+                next_token_ids,
+                requests,
+            )
+        return next_token_ids
+
+    def _install_sampling_seeds(self, forward_batch: Any, requests: list) -> None:
+        """Install per-row ``seed``s onto ``sampling_info`` so SGLang routes to
+        ``multinomial_with_seed``. No-op when no request set a seed, or when a
+        subclass already installed its own (e.g. Qwen3-TTS).
+
+        Runs once per decode step. User-provided seeds are resolved once and
+        cached back onto ``sampling_params.sampling_seed``. In a mixed
+        seeded/unseeded batch the SGLang sampler is batch-wide, so unseeded rows
+        receive a request-id-derived fallback seed instead of a rank-local random
+        seed; this keeps TP ranks in sync without mutating the public request seed.
+        """
+        sampling_info = forward_batch.sampling_info
+        if sampling_info.sampling_seed is not None:
+            self._validate_seeded_sampling_supported(sampling_info)
+            return
+        sampling_params = [sr.data.req.sampling_params for sr in requests]
+        if all(sp.sampling_seed is None for sp in sampling_params):
+            return
+        self._validate_seeded_sampling_supported(sampling_info)
+        row_seeds: list[int] = []
+        for row_idx, (sp, request) in enumerate(zip(sampling_params, requests)):
+            seed = sp.sampling_seed
+            if seed is None:
+                seed = _rank_shared_unseeded_sampling_seed(request, row_idx)
+            elif not (0 <= seed <= SAMPLING_SEED_MASK):
+                seed = resolve_row_seed(seed)  # mask and cache user seed
+                sp.sampling_seed = seed
+            row_seeds.append(seed)
+        sampling_info.sampling_seed = torch.tensor(
+            row_seeds, dtype=torch.long, device=sampling_info.device
+        )
+
+    @staticmethod
+    def _validate_seeded_sampling_supported(sampling_info: Any) -> None:
+        if getattr(sampling_info, "need_min_p_sampling", False):
+            raise ValueError(
+                "SGLang seeded sampling does not support min_p yet; set min_p=0 "
+                "or omit request seed"
+            )
+        need_top_p_sampling = getattr(sampling_info, "need_top_p_sampling", False)
+        need_top_k_sampling = getattr(sampling_info, "need_top_k_sampling", False)
+        if not (need_top_p_sampling or need_top_k_sampling):
+            return
+        if _current_sglang_sampling_backend() == "flashinfer":
+            raise ValueError(
+                "SGLang flashinfer sampling backend does not support request seed "
+                "with top_p/top_k filtering; configure sampling_backend='pytorch' "
+                "or avoid top_p/top_k with seed"
+            )
+
+    @staticmethod
+    def _enable_sampler_logprobs(forward_batch: Any, batch_size: int) -> None:
+        forward_batch.return_logprob = True
+        try:
+            top_logprobs_nums = forward_batch.top_logprobs_nums
+        except AttributeError:
+            top_logprobs_nums = None
+        if top_logprobs_nums is None:
+            forward_batch.top_logprobs_nums = [0] * batch_size
+        try:
+            token_ids_logprobs = forward_batch.token_ids_logprobs
+        except AttributeError:
+            token_ids_logprobs = None
+        if token_ids_logprobs is None:
+            forward_batch.token_ids_logprobs = [None] * batch_size
+
+    def _record_rollout_logprobs(
+        self, next_token_logprobs, next_token_ids, requests
+    ) -> None:
+        """Append each rollout request's sampled-token logprob (one per step)."""
+        logprobs = sampled_logprobs_to_list(next_token_logprobs)
+        if logprobs is None:
+            try:
+                shape = next_token_logprobs.shape
+            except AttributeError:
+                shape = None
+            raise RuntimeError(
+                "Failed to convert sampler next_token_logprobs "
+                f"type={type(next_token_logprobs).__name__} shape={shape}"
+            )
+        if next_token_ids is None:
+            raise RuntimeError("Sampler did not return next_token_ids")
+        try:
+            token_id_values = next_token_ids.tolist()
+        except AttributeError:
+            token_id_values = next_token_ids
+        token_ids = [int(t) for t in token_id_values]
+        if len(logprobs) != len(token_ids) or len(logprobs) != len(requests):
+            raise RuntimeError(
+                "rollout logprob batch-size mismatch: "
+                f"logprobs={len(logprobs)} token_ids={len(token_ids)} "
+                f"requests={len(requests)}"
+            )
+        for row_idx, sched_req in enumerate(requests):
+            data = sched_req.data
+            if data.return_logprob:
+                data.output_token_logprobs.append(
+                    [logprobs[row_idx], token_ids[row_idx]]
+                )
+
+    @staticmethod
+    def _req_is_retracted(req: Any) -> bool:
+        try:
+            return bool(req.is_retracted)
+        except AttributeError:
+            return False
 
     def _apply_repetition_penalty(self, logits_output: Any, requests: list) -> None:
         logits = logits_output.next_token_logits
@@ -590,7 +765,10 @@ class ModelRunner:
             suppress_tokens = data.suppress_tokens
             if not suppress_tokens:
                 req = data.req
-                suppress_tokens = getattr(req, "_codec_suppress_tokens", None)
+                try:
+                    suppress_tokens = req._codec_suppress_tokens
+                except AttributeError:
+                    suppress_tokens = None
             if not suppress_tokens:
                 continue
             for token_id in suppress_tokens:

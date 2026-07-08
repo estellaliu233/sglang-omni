@@ -19,6 +19,7 @@ import threading
 import time
 import types
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable
 
 import torch
@@ -31,8 +32,11 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.utils import broadcast_pyobj
 
 from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.event_recorder import get_active_stage as _get_active_stage
 from sglang_omni.proto.admin import (
     ADMIN_CONTINUE_GENERATION,
+    ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
+    ADMIN_INIT_WEIGHTS_UPDATE_GROUP,
     ADMIN_MODEL_INFO,
     ADMIN_PAUSE_GENERATION,
     ADMIN_UPDATE_WEIGHTS_FROM_DISK,
@@ -111,6 +115,8 @@ class OmniScheduler:
         enable_overlap: bool = False,
         enable_async_decode: bool = False,
         async_decode_min_batch_size: int = 2,
+        request_build_max_workers: int = 1,
+        request_build_max_pending: int | None = None,
     ):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
         self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
@@ -124,6 +130,39 @@ class OmniScheduler:
         self._stream_chunk_handler = stream_chunk_handler
         self._stream_done_handler = stream_done_handler
         self._abort_callback = abort_callback
+        self._request_admission_lock = threading.RLock()
+        self.request_build_max_workers = max(1, int(request_build_max_workers))
+        if self.request_build_max_workers > 1 and int(server_args.tp_size) > 1:
+            logger.warning(
+                "OmniScheduler request-build workers are disabled for "
+                f"tp_size={server_args.tp_size} to preserve identical request "
+                "admission order on every TP rank"
+            )
+            self.request_build_max_workers = 1
+        if self.request_build_max_workers > 1:
+            max_pending = (
+                self.request_build_max_workers
+                if request_build_max_pending is None
+                else int(request_build_max_pending)
+            )
+            self.request_build_max_pending = max(1, max_pending)
+            self._request_build_backlog_limit = max(
+                self.request_build_max_pending,
+                int(server_args.max_queued_requests or 0),
+            )
+            self._request_build_executor: ThreadPoolExecutor | None = (
+                ThreadPoolExecutor(
+                    max_workers=self.request_build_max_workers,
+                    thread_name_prefix="omni-request-build",
+                )
+            )
+        else:
+            self.request_build_max_pending = 0
+            self._request_build_backlog_limit = 0
+            self._request_build_executor = None
+        self._pending_request_builds: dict[str, tuple[Any, bool, Future]] = {}
+        self._backlogged_request_build_payloads: deque[Any] = deque()
+        self._request_build_max_pending_observed = 0
 
         # --- Core scheduling state (read/written by upstream methods) -----
         self.server_args = server_args
@@ -339,11 +378,11 @@ class OmniScheduler:
         self._prefill_start_done: set[str] = set()
 
     def _init_upstream_compat_flags(self, server_args: Any) -> None:
-        self.enable_hisparse = bool(getattr(server_args, "enable_hisparse", False))
+        self.enable_hisparse = bool(server_args.enable_hisparse)
         self.hisparse_coordinator = None
         self.enable_priority_preemption = bool(
-            getattr(server_args, "enable_priority_scheduling", False)
-            and not getattr(server_args, "disable_priority_preemption", False)
+            server_args.enable_priority_scheduling
+            and not server_args.disable_priority_preemption
         )
         # High-water mark, not a cap. Mirrors upstream Scheduler.__init__ (sglang/srt/managers/scheduler.py).
         self.max_prefill_bs = 0
@@ -357,6 +396,13 @@ class OmniScheduler:
         from types import SimpleNamespace
 
         self.session_controller = SimpleNamespace(sessions={})
+        self.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
+        device = getattr(self, "device", None)
+        self.device_module = (
+            torch.get_device_module(device)
+            if device is not None
+            else torch.get_device_module()
+        )
 
     def self_check_during_idle(self) -> None:
         self.new_token_ratio = self.init_new_token_ratio
@@ -468,8 +514,18 @@ class OmniScheduler:
 
     def process_input_requests(self, recv_reqs):
         """Convert incoming payloads to SGLang Reqs and enqueue."""
+        self._drain_request_build_results()
+        recv_reqs, rejected_reqs = self._stage_request_build_payloads(recv_reqs)
+        for payload in rejected_reqs:
+            self._reject_request_build_backlog_overflow(payload)
         for payload in recv_reqs:
             req_id = payload.request_id
+            with self._request_admission_lock:
+                if (
+                    req_id in self._aborted_request_ids
+                    or req_id in self._pending_request_builds
+                ):
+                    continue
             buffered_chunks = self._pending_stream_chunks.pop(req_id, [])
             existing_chunks = list(getattr(payload, "prefetched_chunks", []) or [])
             if existing_chunks:
@@ -485,52 +541,193 @@ class OmniScheduler:
             ):
                 self._deferred_request_payloads[req_id] = payload
                 continue
-            _emit_event(
-                request_id=req_id,
-                stage=None,
-                event_name="scheduler_request_build_start",
-            )
+            active_stage = _get_active_stage()
+            request_build_executor = self._request_build_executor
+            if request_build_executor is not None:
+                with self._request_admission_lock:
+                    if (
+                        req_id in self._aborted_request_ids
+                        or req_id in self._pending_request_builds
+                    ):
+                        continue
+                    future = request_build_executor.submit(
+                        self._run_request_builder, payload, active_stage
+                    )
+                    self._pending_request_builds[req_id] = (
+                        payload,
+                        pending_stream_done,
+                        future,
+                    )
+                    self._request_build_max_pending_observed = max(
+                        self._request_build_max_pending_observed,
+                        len(self._pending_request_builds),
+                    )
+                continue
             try:
-                req_data = self._request_builder(payload)
+                req_data = self._run_request_builder(payload, active_stage)
             except Exception as exc:
                 logger.exception(f"OmniScheduler: request builder failed for {req_id}")
                 self._emit_request_error(req_id, exc)
                 self.abort(req_id)
                 continue
-            if pending_stream_done:
-                self._pending_stream_done.discard(req_id)
-            self._deferred_request_payloads.pop(req_id, None)
-            req = req_data.req
-            req._omni_data = req_data
-            req_id = req.rid
-            _emit_event(
-                request_id=req_id,
-                stage=None,
-                event_name="scheduler_request_build_end",
+            self._enqueue_built_request(payload, pending_stream_done, req_data)
+        self._drain_request_build_results()
+
+    def _run_request_builder(self, payload: Any, active_stage: str | None) -> Any:
+        req_id = payload.request_id
+        _emit_event(
+            request_id=req_id,
+            stage=active_stage,
+            event_name="scheduler_request_build_start",
+        )
+        req_data = self._request_builder(payload)
+        _emit_event(
+            request_id=req_id,
+            stage=active_stage,
+            event_name="scheduler_request_build_end",
+        )
+        return req_data
+
+    def _stage_request_build_payloads(
+        self, recv_reqs: list[Any]
+    ) -> tuple[list[Any], list[Any]]:
+        if self._request_build_executor is None:
+            return list(recv_reqs), []
+
+        with self._request_admission_lock:
+            backlog = self._backlogged_request_build_payloads
+            pending_builds = self._pending_request_builds
+            rejected: list[Any] = []
+            backlog_ids = {payload.request_id for payload in backlog}
+            capacity = max(
+                0,
+                self.request_build_max_pending - len(pending_builds),
             )
-            if bool(getattr(req_data, "enforce_request_limits", False)):
-                error_msg = self._prepare_request_limits(req_data)
-                if error_msg:
-                    self._emit_request_error(req_id, ValueError(error_msg))
-                    self.abort(req_id)
+            selected: list[Any] = []
+            selected_ids: set[str] = set()
+            while capacity > 0 and backlog:
+                payload = backlog.popleft()
+                req_id = payload.request_id
+                backlog_ids.discard(req_id)
+                if req_id in self._aborted_request_ids or req_id in pending_builds:
                     continue
-            kv_error = self._request_kv_capacity_error(req)
-            if kv_error is not None:
-                logger.warning(
-                    f"Rejecting request {req_id} before scheduling: {kv_error}"
+                selected.append(payload)
+                selected_ids.add(req_id)
+                capacity -= 1
+
+            for payload in recv_reqs:
+                req_id = payload.request_id
+                if (
+                    req_id in self._aborted_request_ids
+                    or req_id in pending_builds
+                    or req_id in backlog_ids
+                    or req_id in selected_ids
+                ):
+                    continue
+                if capacity > 0:
+                    selected.append(payload)
+                    selected_ids.add(req_id)
+                    capacity -= 1
+                    continue
+                if len(backlog) >= self._request_build_backlog_limit:
+                    rejected.append(payload)
+                    continue
+                backlog.append(payload)
+                backlog_ids.add(req_id)
+            return selected, rejected
+
+    def _reject_request_build_backlog_overflow(self, payload: Any) -> None:
+        req_id = payload.request_id
+        error = RuntimeError(
+            "request-build backlog is full "
+            f"(backlog_limit={self._request_build_backlog_limit})"
+        )
+        logger.warning("Rejecting request %s before build: %s", req_id, error)
+        self._emit_request_error(req_id, error)
+        self.abort(req_id)
+
+    def _drain_request_build_results(self) -> None:
+        while True:
+            with self._request_admission_lock:
+                if not self._pending_request_builds:
+                    return
+                req_id, (payload, pending_stream_done, future) = next(
+                    iter(self._pending_request_builds.items())
                 )
-                self._emit_request_error(req_id, ValueError(kv_error))
+                if not future.done():
+                    return
+                self._pending_request_builds.pop(req_id, None)
+                if req_id in self._aborted_request_ids:
+                    continue
+            try:
+                req_data = future.result()
+            except Exception as exc:
+                with self._request_admission_lock:
+                    if req_id in self._aborted_request_ids:
+                        continue
+                logger.exception(f"OmniScheduler: request builder failed for {req_id}")
+                self._emit_request_error(req_id, exc)
                 self.abort(req_id)
                 continue
-            self._initialize_request_stream_state(req_data, payload)
+            with self._request_admission_lock:
+                if req_id in self._aborted_request_ids:
+                    continue
+                self._enqueue_built_request(
+                    payload,
+                    pending_stream_done,
+                    req_data,
+                    request_admission_lock_held=True,
+                )
+
+    def _enqueue_built_request(
+        self,
+        payload: Any,
+        pending_stream_done: bool,
+        req_data: Any,
+        *,
+        request_admission_lock_held: bool = False,
+    ) -> None:
+        req_id = payload.request_id
+        if pending_stream_done:
+            self._pending_stream_done.discard(req_id)
+        self._deferred_request_payloads.pop(req_id, None)
+        req = req_data.req
+        req._omni_data = req_data
+        req_id = req.rid
+        if bool(getattr(req_data, "enforce_request_limits", False)):
+            error_msg = self._prepare_request_limits(req_data)
+            if error_msg:
+                self._emit_request_error(req_id, ValueError(error_msg))
+                self.abort(req_id)
+                return
+        kv_error = self._request_kv_capacity_error(req)
+        if kv_error is not None:
+            logger.warning(f"Rejecting request {req_id} before scheduling: {kv_error}")
+            self._emit_request_error(req_id, ValueError(kv_error))
+            self.abort(req_id)
+            return
+        self._initialize_request_stream_state(req_data, payload)
+        for chunk in self._pending_stream_chunks.pop(req_id, []) or []:
+            self._append_stream_chunk(req_data, chunk)
+        if req_id in self._pending_stream_done:
+            self._pending_stream_done.discard(req_id)
+            self._mark_stream_done(req_data)
+
+        def enqueue_if_live() -> None:
             if req_id in self._aborted_request_ids:
-                continue
+                return
             _emit_event(
                 request_id=req_id,
                 stage=None,
                 event_name="scheduler_queue_enter",
             )
             self.waiting_queue.append(req)
+
+        if request_admission_lock_held:
+            enqueue_if_live()
+        else:
+            with self._request_admission_lock:
+                enqueue_if_live()
 
     def _prepare_request_limits(self, req_data: Any) -> str | None:
         req = req_data.req
@@ -737,13 +934,13 @@ class OmniScheduler:
             self._emit_request_error(req.rid, error)
             self.abort(req.rid, defer_running_cleanup=False)
 
-    def _emit_prefill_start_for_batch(self, batch: Any) -> None:
+    def _emit_prefill_start_for_batch(self, batch: ScheduleBatch) -> None:
         """Emit once when a request's first executable batch is selected."""
-        metadata = {}
-        for attr in ("is_prefill_only", "is_extend_in_batch"):
-            if hasattr(batch, attr):
-                metadata[attr] = bool(getattr(batch, attr))
-        for req in getattr(batch, "reqs", []) or []:
+        metadata = {
+            "is_prefill_only": bool(batch.is_prefill_only),
+            "is_extend_in_batch": bool(batch.is_extend_in_batch),
+        }
+        for req in batch.reqs:
             rid = req.rid
             if rid in self._prefill_start_done:
                 continue
@@ -773,6 +970,7 @@ class OmniScheduler:
             # Build result payload from the Req
             data = req._omni_data
             data.output_ids = list(req.output_ids)
+            data.weight_version = self.server_args.weight_version
             finished_reason = req.finished_reason
             data.finish_reason = (
                 finished_reason.to_json().get("type")
@@ -840,6 +1038,7 @@ class OmniScheduler:
                 self._event_loop_normal()
         finally:
             self._scheduler_thread_id = None
+            self._shutdown_request_build_executor()
 
     def event_loop(self) -> None:
         self.start()
@@ -847,12 +1046,35 @@ class OmniScheduler:
     def stop(self) -> None:
         self._running = False
 
+    def _shutdown_request_build_executor(self) -> None:
+        executor = self._request_build_executor
+        if executor is None:
+            return
+        executor.shutdown(wait=False, cancel_futures=True)
+        self._request_build_executor = None
+
     def abort(self, request_id: str, *, defer_running_cleanup: bool = True) -> None:
         running_abort = (
             self._mark_running_request_aborted(request_id)
             if defer_running_cleanup
             else False
         )
+        with self._request_admission_lock:
+            self._aborted_request_ids.add(request_id)
+            pending = self._pending_request_builds.pop(request_id, None)
+            if pending is not None:
+                pending[2].cancel()
+            if self._backlogged_request_build_payloads:
+                retained = [
+                    payload
+                    for payload in self._backlogged_request_build_payloads
+                    if payload.request_id != request_id
+                ]
+                self._backlogged_request_build_payloads.clear()
+                self._backlogged_request_build_payloads.extend(retained)
+            self.waiting_queue = [
+                req for req in self.waiting_queue if req.rid != request_id
+            ]
         if self._abort_callback is not None and not running_abort:
             try:
                 self._abort_callback(request_id)
@@ -860,16 +1082,12 @@ class OmniScheduler:
                 logger.exception(
                     "OmniScheduler: abort cleanup failed for %s", request_id
                 )
-        self._aborted_request_ids.add(request_id)
         self._pending_stream_chunks.pop(request_id, None)
         self._pending_stream_done.discard(request_id)
         self._deferred_request_payloads.pop(request_id, None)
         self._dirty_deferred_request_ids.discard(request_id)
-        self.__dict__.setdefault("_first_emit_done", set()).discard(request_id)
-        self.__dict__.setdefault("_prefill_start_done", set()).discard(request_id)
-        self.waiting_queue = [
-            req for req in self.waiting_queue if req.rid != request_id
-        ]
+        self._first_emit_done.discard(request_id)
+        self._prefill_start_done.discard(request_id)
         if not running_abort:
             self._release_immediate_request_resources(request_id)
             _remove_from_batch(self.running_batch, request_id)
@@ -945,6 +1163,10 @@ class OmniScheduler:
             return self._admin_update_weights_from_tensor(payload)
         if action == ADMIN_UPDATE_WEIGHTS_FROM_DISTRIBUTED:
             return self._admin_update_weights_from_distributed(payload)
+        if action == ADMIN_INIT_WEIGHTS_UPDATE_GROUP:
+            return self._admin_init_weights_update_group(payload)
+        if action == ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP:
+            return self._admin_destroy_weights_update_group(payload)
         if action == ADMIN_WEIGHTS_CHECKER:
             return self._admin_weights_checker(payload)
         return {
@@ -957,18 +1179,29 @@ class OmniScheduler:
         info = {}
         if hasattr(self.model_worker, "model_info"):
             info.update(self.model_worker.model_info())
+        with self._request_admission_lock:
+            request_build_pending = len(self._pending_request_builds)
+            request_build_backlog = len(self._backlogged_request_build_payloads)
+            waiting_queue_size = len(self.waiting_queue)
         info.update(
             {
                 "stage_tp_rank": self.tp_rank,
                 "stage_tp_size": self.tp_size,
                 "engine_paused": self._engine_paused,
-                "waiting_queue_size": len(self.waiting_queue),
+                "waiting_queue_size": waiting_queue_size,
+                "request_build_workers": self.request_build_max_workers,
+                "request_build_pending": request_build_pending,
+                "request_build_max_pending": self.request_build_max_pending,
+                "request_build_backlog": request_build_backlog,
+                "request_build_max_pending_observed": (
+                    self._request_build_max_pending_observed
+                ),
                 "running_batch_size": len(
                     getattr(self.running_batch, "reqs", []) or []
                 ),
-                "model_path": getattr(self.server_args, "model_path", None),
-                "load_format": getattr(self.server_args, "load_format", None),
-                "weight_version": getattr(self.server_args, "weight_version", None),
+                "model_path": self.server_args.model_path,
+                "load_format": self.server_args.load_format,
+                "weight_version": self.server_args.weight_version,
             }
         )
         return {"success": True, "message": "ok", "data": info}
@@ -1023,62 +1256,91 @@ class OmniScheduler:
                 "message": "stage does not support update_weights_from_disk",
                 "data": {"skipped": True, "unsupported": True},
             }
+        return self._run_weight_update_with_lifecycle(
+            payload,
+            self.model_worker.update_weights_from_disk,
+            {
+                "model_path": payload.get("model_path"),
+                "weight_version": payload.get("weight_version"),
+                "token_step": payload.get("token_step"),
+            },
+        )
+
+    def _run_weight_update_with_lifecycle(
+        self,
+        payload: dict[str, Any],
+        update_fn,
+        result_data: dict[str, Any],
+        *,
+        keep_pause_on_failure: bool = False,
+    ) -> dict[str, Any]:
+        keep_pause = bool(payload.get("keep_pause", False))
+        keep_engine_paused = keep_pause
         with self._admin_lock:
             previous_pause_state = self._engine_paused
             self._engine_paused = True
-            self._resolve_pending_async()
-            self._resolve_pending_overlap_results()
-            num_paused = 0
-            abort_all_requests = bool(payload.get("abort_all_requests", False))
-            if abort_all_requests:
-                num_paused = self._abort_all_requests()
-            else:
-                active_request_ids = self._active_request_ids()
-                if active_request_ids and not self._can_update_active_requests(
-                    previous_pause_state
-                ):
-                    if not bool(payload.get("keep_pause", False)):
-                        self._engine_paused = previous_pause_state
-                    return {
-                        "success": False,
-                        "message": (
-                            "active requests are present; set "
-                            "abort_all_requests=true or pause_generation with "
-                            "mode=retract before updating weights"
-                        ),
-                        "error": "active requests present during weight update",
-                        "data": {
-                            "active_request_count": len(active_request_ids),
-                            "active_request_ids": active_request_ids[:16],
-                            "abort_all_requests": abort_all_requests,
-                            "pause_mode": getattr(self, "_last_pause_mode", None),
-                            "engine_paused": self._engine_paused,
-                        },
-                    }
+            try:
+                self._resolve_pending_async()
+                self._resolve_pending_overlap_results()
+                num_paused = 0
+                abort_all_requests = bool(payload.get("abort_all_requests", False))
+                if abort_all_requests:
+                    num_paused = self._abort_all_requests()
+                else:
+                    active_request_ids = self._active_request_ids()
+                    if active_request_ids and not self._can_update_active_requests(
+                        previous_pause_state
+                    ):
+                        if not keep_pause:
+                            self._engine_paused = previous_pause_state
+                        return {
+                            "success": False,
+                            "message": (
+                                "active requests are present; set "
+                                "abort_all_requests=true or pause_generation with "
+                                "mode=retract before updating weights"
+                            ),
+                            "error": "active requests present during weight update",
+                            "data": {
+                                "active_request_count": len(active_request_ids),
+                                "active_request_ids": active_request_ids[:16],
+                                "abort_all_requests": abort_all_requests,
+                                "pause_mode": getattr(self, "_last_pause_mode", None),
+                                "engine_paused": self._engine_paused,
+                            },
+                        }
 
-            success, message = self.model_worker.update_weights_from_disk(payload)
-            flush_success: bool | None = None
-            if success and bool(payload.get("flush_cache", True)):
-                flush_success = self._flush_cache_after_update()
-                success = success and bool(flush_success)
-                if not flush_success:
-                    message = f"{message}; cache flush failed"
+                try:
+                    success, message = update_fn(payload)
+                except Exception:
+                    if keep_pause_on_failure:
+                        keep_engine_paused = True
+                    raise
+                flush_success: bool | None = None
+                if success and bool(payload.get("flush_cache", True)):
+                    flush_success = self._flush_cache_after_update()
+                    success = success and bool(flush_success)
+                    if not flush_success:
+                        message = f"{message}; cache flush failed"
 
-            if bool(payload.get("torch_empty_cache", False)):
-                self._empty_torch_cache()
-            if not bool(payload.get("keep_pause", False)):
-                self._engine_paused = previous_pause_state
+                if keep_pause_on_failure and not success:
+                    keep_engine_paused = True
+                if bool(payload.get("torch_empty_cache", False)):
+                    self._empty_torch_cache()
+            finally:
+                if keep_engine_paused:
+                    self._engine_paused = True
+                else:
+                    self._engine_paused = previous_pause_state
 
         data = {
             "num_paused_requests": num_paused,
             "flush_cache": payload.get("flush_cache", True),
             "flush_success": flush_success,
-            "keep_pause": bool(payload.get("keep_pause", False)),
+            "keep_pause": keep_pause,
             "engine_paused": self._engine_paused,
-            "model_path": payload.get("model_path"),
-            "weight_version": payload.get("weight_version"),
-            "token_step": payload.get("token_step"),
         }
+        data.update(result_data)
         return {
             "success": bool(success),
             "message": str(message),
@@ -1115,17 +1377,60 @@ class OmniScheduler:
                 "message": "stage does not support update_weights_from_distributed",
                 "data": {"skipped": True, "unsupported": True},
             }
+        return self._run_weight_update_with_lifecycle(
+            payload,
+            self.model_worker.update_weights_from_distributed,
+            {
+                "group_name": payload.get("group_name"),
+                "names": payload.get("names", []),
+            },
+            keep_pause_on_failure=True,
+        )
+
+    def _admin_init_weights_update_group(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not hasattr(self.model_worker, "init_weights_update_group"):
+            return {
+                "success": True,
+                "message": "stage does not support init_weights_update_group",
+                "data": {"skipped": True, "unsupported": True},
+            }
+        # Note (Xuesong): init blocks on a NCCL/TCP rendezvous and runs on the
+        # scheduler serving thread (admin is drained inline in the event loop), so
+        # the serving loop is frozen until the trainer (rank 0) joins. sglang's
+        # init_weights_update_group exposes no timeout, so a missing trainer
+        # stalls inference up to NCCL's own timeout. Call this only in
+        # coordination with the trainer (the router takes the worker out of
+        # routing for the duration).
         with self._admin_lock:
-            success, message = self.model_worker.update_weights_from_distributed(
-                payload
-            )
+            success, message = self.model_worker.init_weights_update_group(payload)
         return {
             "success": bool(success),
             "message": str(message),
             "data": {
                 "group_name": payload.get("group_name"),
-                "names": payload.get("names", []),
+                "world_size": payload.get("world_size"),
+                "rank_offset": payload.get("rank_offset"),
             },
+            "error": None if success else str(message),
+        }
+
+    def _admin_destroy_weights_update_group(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not hasattr(self.model_worker, "destroy_weights_update_group"):
+            return {
+                "success": True,
+                "message": "stage does not support destroy_weights_update_group",
+                "data": {"skipped": True, "unsupported": True},
+            }
+        with self._admin_lock:
+            success, message = self.model_worker.destroy_weights_update_group(payload)
+        return {
+            "success": bool(success),
+            "message": str(message),
+            "data": {"group_name": payload.get("group_name")},
             "error": None if success else str(message),
         }
 
@@ -1149,10 +1454,19 @@ class OmniScheduler:
 
     def _active_request_ids(self) -> list[str]:
         request_ids: set[str] = set()
-        for req in self.waiting_queue:
-            rid = getattr(req, "rid", None)
-            if rid is not None:
-                request_ids.add(rid)
+        with self._request_admission_lock:
+            if self._pending_request_builds:
+                request_ids.update(self._pending_request_builds.keys())
+            if self._backlogged_request_build_payloads:
+                request_ids.update(
+                    payload.request_id
+                    for payload in self._backlogged_request_build_payloads
+                    if payload.request_id not in self._aborted_request_ids
+                )
+            for req in self.waiting_queue:
+                rid = getattr(req, "rid", None)
+                if rid is not None:
+                    request_ids.add(rid)
         for batch in (
             self.running_batch,
             self.cur_batch,
@@ -1161,10 +1475,9 @@ class OmniScheduler:
         ):
             if batch is None:
                 continue
-            for req in getattr(batch, "reqs", []) or []:
-                rid = getattr(req, "rid", None)
-                if rid is not None and not req.finished():
-                    request_ids.add(rid)
+            for req in batch.reqs:
+                if req.rid is not None and not req.finished():
+                    request_ids.add(req.rid)
         return sorted(request_ids)
 
     def _can_update_active_requests(
@@ -1336,15 +1649,13 @@ class OmniScheduler:
                 self.self_check_during_busy()
 
     @staticmethod
-    def _batch_is_decode(batch) -> bool:
-        mode = getattr(batch, "forward_mode", None)
+    def _batch_is_decode(batch: ScheduleBatch) -> bool:
+        mode = batch.forward_mode
         if mode is None:
             return False
-        is_decode = getattr(mode, "is_decode", None)
-        if callable(is_decode):
-            return bool(is_decode())
-        is_extend = getattr(mode, "is_extend", None)
-        return (not bool(is_extend())) if callable(is_extend) else False
+        if mode.is_decode():
+            return True
+        return not bool(mode.is_extend())
 
     def _async_pending_batch(self):
         """The in-flight (launched, not yet resolved) decode batch, or None.
@@ -1410,6 +1721,28 @@ class OmniScheduler:
         except Exception as exc:
             self._handle_batch_failure(batch, exc)
 
+    def _free_overrun_step_slots(self, out_cache_loc, drop_indices) -> None:
+        """Free the per-step decode KV slot for rows whose request finished or
+        retracted in a prior step (the lookahead overrun): ``prepare_for_decode``
+        allocated it but ``cache_finished_req`` truncates below it, so it leaks.
+
+        Only under RadixCache + page_size=1; ChunkCache/paged already free the slot
+        with the request, so compensating here would double-free — hence the gate.
+        """
+        if not drop_indices:
+            return
+        if self.page_size != 1 or self.server_args.disable_radix_cache:
+            return
+        if out_cache_loc is None:
+            logger.warning("overrun step-slot free skipped: out_cache_loc is None")
+            return
+        assert max(drop_indices) < out_cache_loc.numel(), (
+            f"overrun drop index {max(drop_indices)} out of range "
+            f"({out_cache_loc.numel()} step slots)"
+        )
+        idx = torch.tensor(drop_indices, dtype=torch.long, device=out_cache_loc.device)
+        self.token_to_kv_pool_allocator.free(out_cache_loc[idx])
+
     def _drop_stale_overrun(self, batch):
         """Drop reqs finished OR retracted by the just-completed drain from the
         stale fast-path batch, so run_batch does not forward/finalize them again
@@ -1425,6 +1758,9 @@ class OmniScheduler:
         if not any(drop):
             return batch
         keep = [i for i, d in enumerate(drop) if not d]
+        self._free_overrun_step_slots(
+            batch.out_cache_loc, [i for i, d in enumerate(drop) if d]
+        )
         batch.filter_batch(keep_indices=keep)
         return batch if batch.reqs else None
 
@@ -1523,7 +1859,7 @@ class OmniScheduler:
         for batch in (self.running_batch, self.cur_batch, self.last_batch):
             if batch is None:
                 continue
-            for req in getattr(batch, "reqs", ()):
+            for req in batch.reqs:
                 if req.rid == request_id:
                     return req._omni_data
         for req in self.waiting_queue:

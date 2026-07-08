@@ -199,11 +199,18 @@ class StageConfig(BaseModel):
 
 
 class PipelineConfig(BaseModel):
-    """Top-level pipeline configuration."""
+    """Top-level pipeline configuration.
+
+    Subclasses set ``requires_model_capabilities`` when their model package
+    must export static architecture-level capability metadata.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
+    architecture: ClassVar[str | None] = None
     architecture_aliases: ClassVar[tuple[str, ...]] = ()
+    requires_model_capabilities: ClassVar[bool] = False
+    tensor_parallel_disable_custom_all_reduce_stages: ClassVar[tuple[str, ...]] = ()
 
     model_path: str
     stages: list[StageConfig]
@@ -257,6 +264,11 @@ class PipelineConfig(BaseModel):
         return {}
 
     @classmethod
+    def generation_sglang_role_to_stage(cls) -> dict[str, str]:
+        """Class-level public role map for generation SGLang ServerArgs overrides."""
+        return {}
+
+    @classmethod
     def code2wav_stage(cls) -> str | None:
         """Return the code2wav stage name when the pipeline supports it."""
         return None
@@ -269,7 +281,17 @@ class PipelineConfig(BaseModel):
         tp_size: int,
     ) -> dict[str, object]:
         """Return SGLang ServerArgs overrides implied by stage TP settings."""
+        if (
+            tp_size > 1
+            and stage_name in cls.tensor_parallel_disable_custom_all_reduce_stages
+        ):
+            return {"disable_custom_all_reduce": True}
         return {}
+
+    @classmethod
+    def topology_gated_custom_all_reduce_stages(cls) -> set[str]:
+        """Stages whose TP custom all-reduce disable is topology-relaxable."""
+        return set()
 
     def requires_uploaded_voice_for_named_voice(self) -> bool:
         """Return whether non-default TTS voice names must be uploaded voices."""

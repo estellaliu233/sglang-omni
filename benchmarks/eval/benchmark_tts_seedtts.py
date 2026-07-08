@@ -44,6 +44,15 @@ Usage:
         --output-dir results/moss_tts_en \
         --lang en --max-concurrency 16
 
+    python -m benchmarks.eval.benchmark_tts_seedtts \
+        --meta zhaochenyang20/seed-tts-eval-arrow \
+        --model OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --port 8000 \
+        --ref-format references \
+        --token-count auto \
+        --output-dir results/moss_tts_en \
+        --lang en --max-concurrency 16
+
+
 3. For CI settings, separate the generate and transcribe phases into two runs.
 
 Usage (CI):
@@ -177,10 +186,12 @@ from benchmarks.metrics.performance import (
     compute_speed_metrics,
     print_speed_summary,
 )
-from benchmarks.tasks.tts import (
+from benchmarks.tasks.asr import (
     DEFAULT_ASR_TRANSCRIBE_CONCURRENCY,
-    MOSS_TTS_TOKEN_COUNT_AUTO,
     QWEN3_ASR_MODEL_PATH,
+)
+from benchmarks.tasks.tts import (
+    MOSS_TTS_TOKEN_COUNT_AUTO,
     build_base_url,
     make_tts_send_fn,
     run_seedtts_similarity,
@@ -236,6 +247,8 @@ class TtsSeedttsBenchmarkConfig:
     stream: bool = False
     initial_codec_chunk_frames: int | None = None
     disable_tqdm: bool = False
+    max_running_requests: int = 64
+    cuda_graph_max_bs: int = 64
     # Transcribe phase
     lang: str = "en"
     device: str = "cuda:0"
@@ -287,6 +300,8 @@ def _build_results_config(
         "concurrency": config.concurrency,
         "request_rate": config.request_rate,
         "initial_codec_chunk_frames": config.initial_codec_chunk_frames,
+        "max_running_requests": config.max_running_requests,
+        "cuda_graph_max_bs": config.cuda_graph_max_bs,
     }
 
 
@@ -412,6 +427,8 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
         stream=args.stream,
         initial_codec_chunk_frames=args.initial_codec_chunk_frames,
         disable_tqdm=args.disable_tqdm,
+        max_running_requests=args.max_running_requests,
+        cuda_graph_max_bs=args.cuda_graph_max_bs,
         lang=args.lang,
         device=args.device,
         similarity_checkpoint=args.similarity_checkpoint,
@@ -617,6 +634,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Timeout in seconds to wait for server readiness.",
     )
     parser.add_argument(
+        "--max-running-requests",
+        type=int,
+        default=64,
+        help=(
+            "SGLang generation stage max_running_requests for the server "
+            "started by this benchmark. Recommended to keep equal to "
+            "--cuda-graph-max-bs. Defaults to 64."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-graph-max-bs",
+        type=int,
+        default=64,
+        help=(
+            "SGLang generation stage cuda_graph_max_bs for the server "
+            "started by this benchmark. Recommended to keep equal to "
+            "--max-running-requests. Defaults to 64."
+        ),
+    )
+    parser.add_argument(
         "--skip-gpu-cleanup",
         action="store_true",
         help=(
@@ -666,6 +703,10 @@ def main() -> None:
         and args.initial_codec_chunk_frames < 0
     ):
         parser.error("--initial-codec-chunk-frames must be non-negative")
+    if args.max_running_requests <= 0:
+        parser.error("--max-running-requests must be positive")
+    if args.cuda_graph_max_bs <= 0:
+        parser.error("--cuda-graph-max-bs must be positive")
     if args.use_existing_server and not (args.generate_only or args.transcribe_only):
         parser.error(
             "--use-existing-server currently requires --generate-only or "
@@ -707,6 +748,8 @@ def main() -> None:
             model_path=config.model,
             port=config.port,
             host=config.host,
+            max_running_requests=config.max_running_requests,
+            cuda_graph_max_bs=config.cuda_graph_max_bs,
             log_file=Path(config.output_dir) / "server_logs" / "tts_server.log",
             timeout=args.server_timeout,
             wait_for_gpu_release=wait_for_gpu_release,

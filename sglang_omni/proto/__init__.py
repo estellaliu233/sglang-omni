@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from .admin import (
     ADMIN_CONTINUE_GENERATION,
+    ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
+    ADMIN_INIT_WEIGHTS_UPDATE_GROUP,
     ADMIN_MODEL_INFO,
     ADMIN_PAUSE_GENERATION,
     ADMIN_UPDATE_WEIGHTS_FROM_DISK,
@@ -24,7 +26,13 @@ from .messages import (
     SubmitMessage,
     parse_message,
 )
-from .request import OmniRequest, RequestInfo, RequestState, StagePayload
+from .request import (
+    EXPLICIT_GENERATION_PARAMS_KEY,
+    OmniRequest,
+    RequestInfo,
+    RequestState,
+    StagePayload,
+)
 from .stage import StageInfo
 
 __all__ = [
@@ -35,6 +43,8 @@ __all__ = [
     "ADMIN_MODEL_INFO",
     "ADMIN_PAUSE_GENERATION",
     "ADMIN_CONTINUE_GENERATION",
+    "ADMIN_INIT_WEIGHTS_UPDATE_GROUP",
+    "ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP",
     "ADMIN_UPDATE_WEIGHTS_FROM_DISK",
     "ADMIN_UPDATE_WEIGHTS_FROM_TENSOR",
     "ADMIN_UPDATE_WEIGHTS_FROM_DISTRIBUTED",
@@ -51,6 +61,7 @@ __all__ = [
     "parse_message",
     "RequestState",
     "RequestInfo",
+    "EXPLICIT_GENERATION_PARAMS_KEY",
     "OmniRequest",
     "StagePayload",
     "StageInfo",

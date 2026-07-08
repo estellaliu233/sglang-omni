@@ -49,7 +49,9 @@ def _resolve_seed(params: dict[str, Any]) -> int | None:
 
 
 def output_modalities(request: OmniRequest | None) -> set[str] | None:
-    metadata = getattr(request, "metadata", None)
+    if request is None:
+        return None
+    metadata = request.metadata
     if not isinstance(metadata, dict):
         return None
     modalities = metadata.get("output_modalities")
@@ -622,6 +624,7 @@ def build_sglang_thinker_request(
         output_ids=req.output_ids,
         req=req,
     )
+    data.return_logprob = bool(params.get("return_logprob"))
     return data
 
 
@@ -795,6 +798,14 @@ def apply_thinker_result(
     finish_reason = getattr(result, "finish_reason", None)
     if finish_reason is not None:
         thinker_out["finish_reason"] = finish_reason
+
+    weight_version = getattr(result, "weight_version", None)
+    if weight_version is not None:
+        thinker_out["weight_version"] = weight_version
+
+    output_token_logprobs = getattr(result, "output_token_logprobs", None)
+    if output_token_logprobs is not None:
+        thinker_out["output_token_logprobs"] = output_token_logprobs
 
     state.thinker_out = thinker_out
     state.engine_outputs[stage_name] = thinker_out

@@ -12,10 +12,16 @@ from sglang_omni.client import Client, GenerateChunk
 from sglang_omni.client.audio import encode_pcm
 from sglang_omni.client.types import GenerateRequest
 from sglang_omni.pipeline.coordinator import Coordinator
-from sglang_omni.proto import CompleteMessage, OmniRequest, StreamMessage
+from sglang_omni.proto import (
+    EXPLICIT_GENERATION_PARAMS_KEY,
+    CompleteMessage,
+    OmniRequest,
+    StreamMessage,
+)
 from sglang_omni.serve import create_app
 from sglang_omni.serve.openai_api import (
     _await_speech_response,
+    _build_chat_generate_request,
     _chat_stream,
     _speech_audio_response,
     build_transcription_generate_request,
@@ -186,6 +192,21 @@ class PrefetchedBlockingStreamingSpeechClient:
         self.aborted.append(request_id)
 
 
+class BlockingFirstAudioStreamingSpeechClient:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.aborted: list[str] = []
+
+    async def generate(self, request: Any, request_id: str | None = None):
+        del request, request_id
+        self.started.set()
+        await asyncio.Future()
+        yield GenerateChunk(request_id="speech-1")
+
+    async def abort(self, request_id: str) -> None:
+        self.aborted.append(request_id)
+
+
 class BlockingNonStreamingSpeechClient:
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -304,6 +325,38 @@ class AdminClient:
         timeout_s: float = 120.0,
     ) -> dict[str, Any]:
         self.calls.append(("update_weights_from_disk", payload, stages, timeout_s))
+        return {"success": True, "message": "ok", "results": []}
+
+    async def init_weights_update_group(
+        self,
+        payload: dict[str, Any],
+        *,
+        stages: list[str] | None = None,
+        timeout_s: float = 300.0,
+    ) -> dict[str, Any]:
+        self.calls.append(("init_weights_update_group", payload, stages, timeout_s))
+        return {"success": True, "message": "ok", "results": []}
+
+    async def destroy_weights_update_group(
+        self,
+        payload: dict[str, Any],
+        *,
+        stages: list[str] | None = None,
+        timeout_s: float = 300.0,
+    ) -> dict[str, Any]:
+        self.calls.append(("destroy_weights_update_group", payload, stages, timeout_s))
+        return {"success": True, "message": "ok", "results": []}
+
+    async def update_weights_from_distributed(
+        self,
+        payload: dict[str, Any],
+        *,
+        stages: list[str] | None = None,
+        timeout_s: float = 300.0,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            ("update_weights_from_distributed", payload, stages, timeout_s)
+        )
         return {"success": True, "message": "ok", "results": []}
 
     async def admin(
@@ -538,6 +591,58 @@ def test_chat_stream_failure_closes_without_done_sentinel() -> None:
     assert all(chunk != "data: [DONE]\n\n" for chunk in chunks)
 
 
+def test_chat_request_omits_explicit_params_when_sampling_omitted() -> None:
+    req = ChatCompletionRequest(
+        model="OpenMOSS-Team/MOSS-Transcribe-Diarize",
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    gen_req = _build_chat_generate_request(req)
+
+    assert gen_req.sampling.temperature == 1.0
+    assert gen_req.sampling.top_p == 1.0
+    assert gen_req.sampling.top_k == -1
+    assert EXPLICIT_GENERATION_PARAMS_KEY not in gen_req.metadata
+
+
+def test_chat_request_preserves_explicit_default_sampling_values() -> None:
+    req = ChatCompletionRequest(
+        model="OpenMOSS-Team/MOSS-Transcribe-Diarize",
+        messages=[{"role": "user", "content": "hello"}],
+        temperature=1.0,
+        top_p=1.0,
+        top_k=-1,
+    )
+
+    gen_req = _build_chat_generate_request(req)
+
+    assert gen_req.sampling.temperature == 1.0
+    assert gen_req.sampling.top_p == 1.0
+    assert gen_req.sampling.top_k == -1
+    assert gen_req.metadata[EXPLICIT_GENERATION_PARAMS_KEY] == [
+        "temperature",
+        "top_k",
+        "top_p",
+    ]
+
+
+def test_chat_request_does_not_mark_null_sampling_params_explicit() -> None:
+    req = ChatCompletionRequest(
+        model="OpenMOSS-Team/MOSS-Transcribe-Diarize",
+        messages=[{"role": "user", "content": "hello"}],
+        temperature=None,
+        top_p=None,
+        top_k=None,
+    )
+
+    gen_req = _build_chat_generate_request(req)
+
+    assert gen_req.sampling.temperature == 1.0
+    assert gen_req.sampling.top_p == 1.0
+    assert gen_req.sampling.top_k == -1
+    assert EXPLICIT_GENERATION_PARAMS_KEY not in gen_req.metadata
+
+
 def test_speech_stream_defaults_to_raw_pcm() -> None:
     client = TestClient(
         create_app(SuccessfulSpeechClient(), model_name="higgs-audio-v2")
@@ -588,6 +693,7 @@ def test_raw_pcm_response_close_aborts_inner_speech_stream() -> None:
     async def _drive() -> None:
         client = PrefetchedBlockingStreamingSpeechClient()
         response = await _speech_audio_response(
+            request=ConnectedRequest(),
             client=client,
             gen_req=GenerateRequest(model="s2-pro", prompt="hello", stream=True),
             request_id="req-1",
@@ -596,6 +702,28 @@ def test_raw_pcm_response_close_aborts_inner_speech_stream() -> None:
         body = response.body_iterator
         assert await anext(body) == encode_pcm([0.0, 0.1, -0.1, 0.0], 24000)
         await body.aclose()
+        assert client.aborted == ["req-1"]
+
+    asyncio.run(_drive())
+
+
+def test_raw_pcm_response_disconnect_before_first_chunk_aborts_request() -> None:
+    async def _drive() -> None:
+        client = BlockingFirstAudioStreamingSpeechClient()
+        request = DisconnectingRequest()
+        task = asyncio.create_task(
+            _speech_audio_response(
+                request=request,
+                client=client,
+                gen_req=GenerateRequest(model="s2-pro", prompt="hello", stream=True),
+                request_id="req-1",
+                speed=1.0,
+            )
+        )
+        await client.started.wait()
+        request.disconnected.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
         assert client.aborted == ["req-1"]
 
     asyncio.run(_drive())
@@ -761,10 +889,52 @@ def test_transcription_request_builds_asr_generate_request() -> None:
         "filename": "sample.wav",
         "content_type": "audio/wav",
     }
-    assert gen_req.extra_params == {"task": "transcribe", "language": "en"}
+    assert gen_req.extra_params == {
+        "task": "transcribe",
+        "language": "en",
+    }
+    assert gen_req.sampling.temperature == 0.0
+    omni_req = Client._build_omni_request(gen_req)
+    assert omni_req.params["temperature"] == 0.0
     assert gen_req.metadata == {"task": "asr"}
     assert gen_req.output_modalities == ["text"]
     assert gen_req.stream is False
+
+
+def test_transcription_request_passes_explicit_temperature() -> None:
+    gen_req = build_transcription_generate_request(
+        audio_bytes=b"RIFF",
+        filename="sample.wav",
+        content_type="audio/wav",
+        model="openai/whisper-large-v3",
+        language="en",
+        prompt=None,
+        temperature=0.7,
+    )
+
+    assert gen_req.sampling.temperature == 0.7
+    assert gen_req.metadata[EXPLICIT_GENERATION_PARAMS_KEY] == ["temperature"]
+    omni_req = Client._build_omni_request(gen_req)
+    assert omni_req.params["temperature"] == 0.7
+
+
+def test_transcription_request_passes_explicit_max_new_tokens() -> None:
+    gen_req = build_transcription_generate_request(
+        audio_bytes=b"RIFF",
+        filename="sample.wav",
+        content_type="audio/wav",
+        model="OpenMOSS-Team/MOSS-Transcribe-Diarize",
+        language="en",
+        prompt=None,
+        temperature=None,
+        max_new_tokens=4096,
+    )
+
+    assert gen_req.model == "OpenMOSS-Team/MOSS-Transcribe-Diarize"
+    assert gen_req.sampling.max_new_tokens == 4096
+    assert gen_req.metadata[EXPLICIT_GENERATION_PARAMS_KEY] == ["max_new_tokens"]
+    omni_req = Client._build_omni_request(gen_req)
+    assert omni_req.params["max_new_tokens"] == 4096
 
 
 def test_transcription_endpoint_returns_text_json() -> None:
@@ -786,6 +956,164 @@ def test_transcription_endpoint_returns_text_json() -> None:
     assert request.model == "openai/whisper-large-v3"
     assert request.prompt["filename"] == "sample.wav"
     assert request.extra_params["language"] == "en"
+
+
+def test_transcription_endpoint_passes_explicit_max_new_tokens() -> None:
+    transcription_client = SuccessfulTranscriptionClient()
+    client = TestClient(
+        create_app(
+            transcription_client,
+            model_name="OpenMOSS-Team/MOSS-Transcribe-Diarize",
+        )
+    )
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={
+            "model": "OpenMOSS-Team/MOSS-Transcribe-Diarize",
+            "max_new_tokens": "4096",
+        },
+        files={"file": ("sample.wav", b"RIFF", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert transcription_client.requests
+    request = transcription_client.requests[0]
+    assert request.model == "OpenMOSS-Team/MOSS-Transcribe-Diarize"
+    assert request.sampling.max_new_tokens == 4096
+    assert request.metadata[EXPLICIT_GENERATION_PARAMS_KEY] == ["max_new_tokens"]
+
+
+def test_transcription_endpoint_uses_openai_temperature_default() -> None:
+    transcription_client = SuccessfulTranscriptionClient()
+    client = TestClient(
+        create_app(transcription_client, model_name="openai/whisper-large-v3")
+    )
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "openai/whisper-large-v3"},
+        files={"file": ("sample.wav", b"RIFF", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert transcription_client.requests
+    request = transcription_client.requests[0]
+    assert request.sampling.temperature == 0.0
+    assert EXPLICIT_GENERATION_PARAMS_KEY not in request.metadata
+
+
+def test_transcription_endpoint_marks_mtd_request_for_model_sampling_defaults() -> None:
+    transcription_client = SuccessfulTranscriptionClient()
+    client = TestClient(
+        create_app(
+            transcription_client,
+            model_name="OpenMOSS-Team/MOSS-Transcribe-Diarize",
+            architectures=["MossTranscribeDiarizeForConditionalGeneration"],
+        )
+    )
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "OpenMOSS-Team/MOSS-Transcribe-Diarize"},
+        files={"file": ("sample.wav", b"RIFF", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert transcription_client.requests
+    request = transcription_client.requests[0]
+    assert request.sampling.temperature == 0.0
+    assert EXPLICIT_GENERATION_PARAMS_KEY not in request.metadata
+
+
+class DiarizationTranscriptionClient:
+    """Stub returning MOSS-style diarized markup for verbose_json tests."""
+
+    async def completion(self, request, *, request_id, audio_format="wav"):
+        from sglang_omni.client.types import CompletionResult
+
+        del request, request_id, audio_format
+        return CompletionResult(
+            request_id="transcription-1",
+            text="[0.00][S01] hello there.[1.20][1.30][S02] bye.[3.00]",
+        )
+
+
+def test_transcription_verbose_json_returns_diarized_segments() -> None:
+    client = TestClient(
+        create_app(
+            DiarizationTranscriptionClient(),
+            model_name="moss-transcribe-diarize",
+            architectures=["MossTranscribeDiarizeForConditionalGeneration"],
+        )
+    )
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "moss-transcribe-diarize", "response_format": "verbose_json"},
+        files={"file": ("sample.wav", b"RIFF", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["task"] == "transcribe"
+    assert [(s["id"], s["start"], s["end"], s["text"]) for s in body["segments"]] == [
+        (0, 0.0, 1.2, "[S01]hello there."),
+        (1, 1.3, 3.0, "[S02]bye."),
+    ]
+
+
+def test_transcription_verbose_json_falls_back_for_plain_text() -> None:
+    client = TestClient(
+        create_app(
+            SuccessfulTranscriptionClient(),
+            model_name="moss-transcribe-diarize",
+            architectures=["MossTranscribeDiarizeForConditionalGeneration"],
+        )
+    )
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "moss-transcribe-diarize", "response_format": "verbose_json"},
+        files={"file": ("sample.wav", b"RIFF", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["segments"]) == 1
+    assert body["segments"][0]["text"] == "[S01]hello world"
+
+
+def _wav_bytes(duration_s: float, sample_rate: int = 16000) -> bytes:
+    import io
+
+    import numpy as np
+    import soundfile as sf
+
+    samples = np.zeros(int(duration_s * sample_rate), dtype=np.float32)
+    buf = io.BytesIO()
+    sf.write(buf, samples, sample_rate, format="WAV")
+    return buf.getvalue()
+
+
+def test_transcription_probes_duration_from_real_wav() -> None:
+    client = TestClient(
+        create_app(
+            DiarizationTranscriptionClient(),
+            model_name="moss-transcribe-diarize",
+            architectures=["MossTranscribeDiarizeForConditionalGeneration"],
+        )
+    )
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "moss-transcribe-diarize", "response_format": "verbose_json"},
+        files={"file": ("sample.wav", _wav_bytes(3.5), "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["usage"] == {"type": "duration", "seconds": 4}
 
 
 def test_speech_request_passes_moss_token_count() -> None:
@@ -810,6 +1138,8 @@ _ADMIN_PATHS_THAT_NEED_AUTH = [
     ("POST", "/update_weights_from_disk"),
     ("POST", "/update_weights_from_tensor"),
     ("POST", "/update_weights_from_distributed"),
+    ("POST", "/init_weights_update_group"),
+    ("POST", "/destroy_weights_update_group"),
     ("GET", "/weights_checker"),
     ("POST", "/weights_checker"),
 ]
@@ -901,38 +1231,98 @@ def test_admin_routes_env_key_is_used_when_no_explicit_key(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("path", "payload"),
-    [
-        ("/update_weights_from_tensor", {}),
-        (
-            "/update_weights_from_distributed",
-            {"names": [], "dtypes": [], "shapes": []},
-        ),
-    ],
-)
-def test_unimplemented_weight_update_endpoints_return_501(
-    path: str,
-    payload: dict[str, Any],
-) -> None:
+def test_unimplemented_tensor_weight_update_returns_501() -> None:
     admin = AdminClient()
     client = TestClient(create_app(admin, model_name="qwen3-omni"))
 
-    resp = client.post(path, json=payload)
+    resp = client.post("/update_weights_from_tensor", json={})
     assert resp.status_code == 501
     assert resp.json()["error"]["code"] == "not_implemented"
     assert "update_weights_from_disk" in resp.json()["error"]["message"]
 
 
-def test_stub_endpoints_also_check_auth_before_501() -> None:
-    """Auth check fires before the 501 body."""
+def test_distributed_weight_update_routes_forward_to_client() -> None:
+    admin = AdminClient()
+    client = TestClient(create_app(admin, model_name="qwen3-omni"))
+
+    init = client.post(
+        "/init_weights_update_group",
+        json={
+            "master_address": "10.0.0.1",
+            "master_port": 12355,
+            "world_size": 2,
+            "rank_offset": 1,
+            "stages": ["talker"],
+            "timeout_s": 0,
+        },
+    )
+    update = client.post(
+        "/update_weights_from_distributed",
+        json={
+            "names": ["w.0"],
+            "dtypes": ["bfloat16"],
+            "shapes": [[2, 2]],
+            "group_name": "weight_update_group",
+            "weight_version": "v2",
+            "timeout_s": 0,
+        },
+    )
+    destroy = client.post(
+        "/destroy_weights_update_group",
+        json={
+            "group_name": "weight_update_group",
+            "stages": ["talker"],
+            "timeout_s": 0,
+        },
+    )
+
+    assert init.status_code == 200
+    assert update.status_code == 200
+    assert destroy.status_code == 200
+    assert admin.calls == [
+        (
+            "init_weights_update_group",
+            {
+                "master_address": "10.0.0.1",
+                "master_port": 12355,
+                "world_size": 2,
+                "rank_offset": 1,
+                "group_name": "weight_update_group",
+                "backend": "nccl",
+            },
+            ["talker"],
+            0,
+        ),
+        (
+            "update_weights_from_distributed",
+            {
+                "names": ["w.0"],
+                "dtypes": ["bfloat16"],
+                "shapes": [[2, 2]],
+                "group_name": "weight_update_group",
+                "flush_cache": True,
+                "abort_all_requests": False,
+                "weight_version": "v2",
+                "torch_empty_cache": False,
+            },
+            None,
+            0,
+        ),
+        (
+            "destroy_weights_update_group",
+            {"group_name": "weight_update_group"},
+            ["talker"],
+            0,
+        ),
+    ]
+
+
+def test_stub_endpoint_checks_auth_before_501() -> None:
+    """Auth check fires before the tensor stub 501 body."""
     admin = AdminClient()
     client = TestClient(
         create_app(admin, model_name="qwen3-omni", admin_api_key=_ADMIN_API_KEY)
     )
 
     resp = client.post("/update_weights_from_tensor", json={})
-    assert resp.status_code == 401
-
-    resp = client.post("/update_weights_from_distributed", json={})
     assert resp.status_code == 401

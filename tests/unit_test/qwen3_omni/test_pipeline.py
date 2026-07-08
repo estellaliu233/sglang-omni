@@ -22,6 +22,11 @@ from sglang_omni.config import (
     build_stage_placement_plan,
     resolve_stage_factory_args,
 )
+from sglang_omni.models.ming_omni.config import (
+    MingOmniPipelineConfig,
+    MingOmniSpeechPipelineConfig,
+    MingOmniStreamingSpeechPipelineConfig,
+)
 from sglang_omni.models.qwen3_omni.config import (
     Qwen3OmniPipelineConfig,
     Qwen3OmniSpeechColocatedPipelineConfig,
@@ -30,6 +35,7 @@ from sglang_omni.models.qwen3_omni.config import (
 from sglang_omni.models.qwen3_omni.merge import decode_events, merge_for_thinker
 from sglang_omni.models.qwen3_omni.payload_types import Qwen3OmniPipelineState
 from sglang_omni.models.qwen3_omni.request_builders import (
+    apply_thinker_result,
     build_sglang_thinker_request,
     project_preprocessing_to_mm_aggregate,
     project_talker_to_code2wav,
@@ -37,6 +43,7 @@ from sglang_omni.models.qwen3_omni.request_builders import (
     resolve_mm_aggregate_wait_sources,
     resolve_preprocessing_next_stages,
 )
+from sglang_omni.pipeline.tensor_ref import TensorRef, is_tensor_ref_dict
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.sglang_backend.server_args_builder import (
     apply_encoder_mem_reserve,
@@ -212,6 +219,66 @@ def test_qwen_thinker_to_decode_projection_isolates_stream_state() -> None:
     assert projected.data["stream_state"] == stream_state
     assert projected.data["stream_state"] is not stream_state
     assert projected.data["stream_state"]["token_ids"] is not stream_state["token_ids"]
+
+
+def test_qwen_apply_thinker_result_preserves_empty_logprob_list() -> None:
+    state = Qwen3OmniPipelineState()
+    result = SimpleNamespace(
+        output_ids=[],
+        extra_model_outputs={},
+        finish_reason=None,
+        weight_version=None,
+        output_token_logprobs=[],
+    )
+
+    thinker_out = apply_thinker_result(state, stage_name="thinker", result=result)
+
+    assert thinker_out["output_token_logprobs"] == []
+    assert state.thinker_out["output_token_logprobs"] == []
+    assert state.engine_outputs["thinker"]["output_token_logprobs"] == []
+
+
+def test_qwen_apply_thinker_result_omits_missing_optional_fields() -> None:
+    state = Qwen3OmniPipelineState()
+    result = SimpleNamespace(output_ids=[8], extra_model_outputs={})
+
+    thinker_out = apply_thinker_result(state, stage_name="thinker", result=result)
+
+    assert "finish_reason" not in thinker_out
+    assert "weight_version" not in thinker_out
+    assert "output_token_logprobs" not in thinker_out
+    assert state.thinker_out is thinker_out
+    assert state.engine_outputs["thinker"] is thinker_out
+
+
+def test_qwen_preprocess_pretokenized_builds_thinker_state_from_ids() -> None:
+    # Miles RL rollout sends pre-tokenized input_ids; they must reach the thinker
+    # directly (no chat template / re-tokenize), with encoders skipped.
+    from sglang_omni.models.qwen3_omni.components.preprocessor import (
+        Qwen3OmniPreprocessor,
+        _is_pretokenized_prompt,
+    )
+
+    assert _is_pretokenized_prompt([5, 6, 7]) is True
+    assert _is_pretokenized_prompt([]) is False
+    assert _is_pretokenized_prompt([{"role": "user", "content": "hi"}]) is False
+    assert _is_pretokenized_prompt("hi") is False
+
+    pre = object.__new__(Qwen3OmniPreprocessor)
+    pre.max_seq_len = None
+    payload = SimpleNamespace(
+        request=SimpleNamespace(params={"max_new_tokens": 16}),
+        request_id="r1",
+        data=None,
+    )
+
+    out = pre._preprocess_pretokenized(payload, [5, 6, 7])
+
+    state = Qwen3OmniPipelineState.from_dict(out.data)
+    assert state.prompt["input_ids"].tolist() == [5, 6, 7]
+    assert state.prompt["attention_mask"].tolist() == [1, 1, 1]
+    assert state.encoder_inputs["image_encoder"]["_skip"] is True
+    assert state.encoder_inputs["audio_encoder"]["_skip"] is True
 
 
 def test_qwen_talker_to_code2wav_projection_keeps_only_request_latch() -> None:
@@ -571,7 +638,9 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     from sglang_omni.scheduling import bootstrap as scheduling_bootstrap
     from sglang_omni.scheduling import omni_scheduler, sglang_backend
 
-    server_args = SimpleNamespace(disable_cuda_graph=False)
+    server_args = SimpleNamespace(
+        disable_cuda_graph=False, enable_return_hidden_states=False
+    )
     infrastructure_saw_graph_disabled: list[bool] = []
     capture_hidden_layers_seen: list[list[int] | None] = []
     init_graph_calls = 0
@@ -645,7 +714,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     assert infrastructure_saw_graph_disabled == [expected_infrastructure_graph_disabled]
     assert capture_hidden_layers_seen == [expected_capture_hidden_layers]
     assert init_graph_calls == expected_init_graph_calls
-    assert getattr(server_args, "enable_return_hidden_states", False) is speech_enabled
+    assert server_args.enable_return_hidden_states is speech_enabled
     assert server_args.disable_cuda_graph is False
     assert scheduler.server_args is server_args
 
@@ -877,6 +946,101 @@ def test_qwen_text_thinker_tp_builds_topology_without_memory_fractions() -> None
     assert _stage(config, "thinker").runtime.resources.total_gpu_memory_fraction is None
 
 
+def test_qwen_thinker_tp_disables_custom_all_reduce_across_configs() -> None:
+    """TP>1 thinker must drop the custom all-reduce kernel (parity w/ MingOmni).
+
+    Regression guard for issue #760: a ``sglang_omni serve`` launch (not just the
+    example script) must auto-inject ``disable_custom_all_reduce`` for the
+    multi-process thinker TP path.
+    """
+    for cls in (
+        Qwen3OmniPipelineConfig,
+        Qwen3OmniSpeechPipelineConfig,
+        Qwen3OmniSpeechColocatedPipelineConfig,
+    ):
+        assert cls.tensor_parallel_server_args_overrides(
+            stage_name="thinker", tp_size=2
+        ) == {"disable_custom_all_reduce": True}
+        assert (
+            cls.tensor_parallel_server_args_overrides(stage_name="thinker", tp_size=1)
+            == {}
+        )
+        for stage_name in ("audio_encoder", "image_encoder", "talker_ar", "code2wav"):
+            assert (
+                cls.tensor_parallel_server_args_overrides(
+                    stage_name=stage_name, tp_size=4
+                )
+                == {}
+            )
+
+
+def test_thinker_tp_disable_custom_all_reduce_uses_shared_config_hook() -> None:
+    classes = (
+        Qwen3OmniPipelineConfig,
+        Qwen3OmniSpeechPipelineConfig,
+        Qwen3OmniSpeechColocatedPipelineConfig,
+        MingOmniPipelineConfig,
+        MingOmniSpeechPipelineConfig,
+        MingOmniStreamingSpeechPipelineConfig,
+    )
+
+    for cls in classes:
+        assert "tensor_parallel_server_args_overrides" not in cls.__dict__
+        assert cls.tensor_parallel_server_args_overrides(
+            stage_name="thinker",
+            tp_size=2,
+        ) == {"disable_custom_all_reduce": True}
+
+
+def test_qwen_cli_serve_applies_thinker_tp_override_to_server_args(monkeypatch) -> None:
+    """End-to-end: the CLI TP pass writes disable_custom_all_reduce into the
+    thinker stage server args when TP>1 is configured (issue #760)."""
+    from sglang_omni.cli.serve import _apply_tensor_parallel_server_args_overrides
+
+    monkeypatch.setattr(
+        "sglang_omni.cli.serve.should_disable_custom_all_reduce_for_gpus",
+        lambda *args, **kwargs: True,
+    )
+    config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
+    apply_parallelism_cli_overrides(
+        config,
+        thinker_tp_size=2,
+        thinker_gpus="0,1",
+        talker_gpu=None,
+        code2wav_gpu=None,
+    )
+    _apply_tensor_parallel_server_args_overrides(config)
+
+    assert (
+        _server_args_overrides(config, "thinker")["disable_custom_all_reduce"] is True
+    )
+    assert "disable_custom_all_reduce" not in _server_args_overrides(
+        config, "audio_encoder"
+    )
+
+
+def test_qwen_cli_serve_enables_custom_all_reduce_on_p2p_mesh(monkeypatch) -> None:
+    from sglang_omni.cli.serve import _apply_tensor_parallel_server_args_overrides
+
+    monkeypatch.setattr(
+        "sglang_omni.cli.serve.should_disable_custom_all_reduce_for_gpus",
+        lambda *args, **kwargs: False,
+    )
+    config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
+    apply_parallelism_cli_overrides(
+        config,
+        thinker_tp_size=2,
+        thinker_gpus="0,1",
+        talker_gpu=None,
+        code2wav_gpu=None,
+    )
+    _apply_tensor_parallel_server_args_overrides(config)
+
+    assert (
+        _server_args_overrides(config, "thinker")["disable_custom_all_reduce"] is False
+    )
+
+
 def test_qwen_thinker_auto_path_applies_encoder_reserve() -> None:
     server_args = SimpleNamespace(mem_fraction_static=0.929)
 
@@ -985,6 +1149,37 @@ def test_qwen_mm_aggregate_keeps_lightweight_inputs_and_prunes_after_merge() -> 
         "video": "video:image-cache",
         "audio": "audio:audio-cache",
     }
+
+
+def test_qwen_merge_preserves_unresolved_video_tensor_ref() -> None:
+    """A lazily-externalized video_embeds ref survives merge unresolved."""
+    ref = TensorRef(
+        ref_id="req-qwen:tensor_ref:image_encoder:mm_aggregate:abc:video_embeds",
+        request_id="req-qwen",
+        producer_stage="image_encoder",
+        consumer_stage="thinker",
+        path="encoder_outs.image_encoder.video_embeds",
+        shape=(4, 8),
+        dtype="torch.bfloat16",
+        nbytes=4 * 8 * 2,
+        blob_key="req-qwen:tensor_ref:image_encoder:mm_aggregate:abc:video_embeds",
+        blob_metadata={"relay_info": {}, "tensor_shape": [4, 8]},
+    )
+    image_state = Qwen3OmniPipelineState(
+        encoder_outs={"image_encoder": {"video_embeds": ref.to_dict()}}
+    )
+
+    merged = merge_for_thinker(
+        {
+            "preprocessing": make_qwen_payload(make_qwen_state()),
+            "image_encoder": make_qwen_payload(image_state),
+        }
+    )
+    merged_state = Qwen3OmniPipelineState.from_dict(merged.data)
+
+    video_embeds = merged_state.thinker_inputs["model_inputs"]["video_embeds"]
+    assert is_tensor_ref_dict(video_embeds)
+    assert video_embeds == ref.to_dict()
 
 
 def test_qwen_thinker_request_and_decode_contracts() -> None:
