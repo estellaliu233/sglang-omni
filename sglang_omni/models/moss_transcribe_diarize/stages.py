@@ -16,6 +16,7 @@ from sglang_omni.models.moss_transcribe_diarize import (  # noqa: F401
 )
 from sglang_omni.models.moss_transcribe_diarize.request_builders import (
     make_moss_transcribe_diarize_scheduler_adapters,
+    make_moss_transcribe_diarize_stream_output_builder,
 )
 from sglang_omni.scheduling.bootstrap import (
     create_sglang_infrastructure_defer_cuda_graph,
@@ -96,6 +97,7 @@ def create_sglang_moss_transcribe_diarize_executor(
     async_decode_min_batch_size: int = 2,
     request_build_max_workers: int = 2,
     request_build_max_pending: int | None = 16,
+    stream_emit_interval_s: float = 0.05,
     server_args_overrides: dict[str, Any] | None = None,
 ):
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
@@ -168,6 +170,10 @@ def create_sglang_moss_transcribe_diarize_executor(
         tokenizer=tokenizer,
         max_new_tokens=resolved_max_new_tokens,
     )
+    stream_output_builder = make_moss_transcribe_diarize_stream_output_builder(
+        tokenizer=tokenizer,
+        min_emit_interval_s=stream_emit_interval_s,
+    )
 
     return OmniScheduler(
         tp_worker=model_worker,
@@ -181,6 +187,7 @@ def create_sglang_moss_transcribe_diarize_executor(
         model_runner=ModelRunner(model_worker, output_proc),
         request_builder=request_builder,
         result_adapter=result_adapter,
+        stream_output_builder=stream_output_builder,
         enable_async_decode=enable_async_decode,
         async_decode_min_batch_size=async_decode_min_batch_size,
         request_build_max_workers=request_build_max_workers,
