@@ -469,24 +469,26 @@ Use the response and health signals to choose the next step:
 |---|---|---|
 | `/live` fails | The Router process is not reachable. | Check the process, bind address, port, and startup logs. |
 | `/live` is `200`, `/ready` is `503` | No worker is routable. | Inspect the worker states in `/workers`. |
+| Model request: `413`, `message=payload too large` | The request body exceeds `--max-payload-size`. | Reduce the request size or, after checking memory and concurrency impact, raise the configured limit. |
+| Large JSON model request: `400` requiring a route-hint header | JSON bodies larger than 1 MiB are not fully parsed, so the Router cannot infer the model or capabilities needed to select from a mixed worker pool. | Set the header named in the error message, such as `x-sglang-omni-route-model` or `x-sglang-omni-route-capabilities`; see [Routing Behavior](#routing-behavior). |
+| Model request: `400`, `message` names a route-hint header | A route-hint header is malformed or disagrees with the JSON body: an empty value, an unsupported capability, or a value that conflicts with the body's `model` or `stream`. | Read the message; it names the offending header. The rejection log records the same message in `reason=`, with spaces replaced by underscores. |
 | Model request: `503`, `type=overloaded_error`, `Retry-After: 1` | Router admission is full. | Back off and inspect `inflight`, `max_inflight`, and `rejected_total` in `/health`. |
 | Model request: `503`, `message=no eligible upstream` | No routable worker matches the request. | Check worker routability, model, and capabilities. |
 | Model request: `503` with `X-SGLang-Omni-Worker` | The selected worker returned `503`. | Inspect that worker's logs and `/health` endpoint. |
+| Streaming response starts with `200` but ends early | The worker failed after response headers were relayed, so the status can no longer become `502`. An SSE response ends with a terminal `upstream stream failed before completion` event whose body carries `"code": 502`; the HTTP status stays `200`. A non-SSE response, such as audio or JSON, truncates with no error frame. | Check the route-completion log for `outcome=stream_error` (a client disconnect logs `stream_cancelled` instead), then inspect the selected worker. |
 
-Admission rejection logs contain `reason=router_overloaded`; selection failures
-contain `reason=no_eligible_upstream` plus the inferred model and capabilities.
-A selection failure occurs before a worker is chosen and therefore has no
+For admission limits, rejection logs, and capacity guidance, see
+[Overload Behavior](#overload-behavior). Selection failures contain
+`reason=no_eligible_upstream` plus the inferred model and capabilities. They
+occur before a worker is chosen and therefore have no
 `X-SGLang-Omni-Worker` header. A worker-returned `503` does not by itself evict
 the worker.
 
-Measure worker-pool capacity and acceptable latency before raising
-`--max-connections` or `--max-inflight`; a higher bound can replace fast
-rejections with a longer queue.
-
 ### Distinguish `502` Responses
 
-Both kinds of `502` include `X-SGLang-Omni-Worker`; use the body to distinguish
-them:
+For model requests that select a single worker, a `502` with
+`X-SGLang-Omni-Worker` can come from either the Router or the selected worker.
+Use the body to distinguish them:
 
 - `{"error": {"message": "upstream request failed"}}`: the Router selected a
   worker, but a connection error or timeout prevented it from obtaining a
@@ -495,20 +497,26 @@ them:
 - Any other body: the selected worker returned its own `502`, which the Router
   relayed. Investigate that worker's upstream dependencies.
 
-Transport failures and worker-returned `502` or `504` responses count toward
-`--health-failure-threshold`. A threshold of `1` marks the worker unhealthy on
-the first such failure.
+This distinction does not apply to `/v1/models` or administrative broadcast
+routes. Those routes may return a Router-generated `502` without selecting a
+single worker and therefore without `X-SGLang-Omni-Worker`.
+
+For how transport failures and worker-returned `502` or `504` responses affect
+worker health, see [Failure Handling](#failure-handling).
 
 ### Inspect Worker State
 
-Print the fields used to determine routability:
+Print the fields used to determine routability. `worker_id` is the
+percent-encoded identifier the admin routes expect; `display_id` is the
+host and port shown in logs:
 
 ```bash
 curl -s http://127.0.0.1:8008/workers | python3 -c '
 import json, sys
 for worker in json.load(sys.stdin)["workers"]:
     print(
-        worker["display_id"],
+        "worker_id=" + worker["worker_id"],
+        "display_id=" + worker["display_id"],
         "state=" + worker["health_state"],
         "disabled=" + str(worker["disabled"]),
         "routable=" + str(worker["routable"]),
@@ -582,9 +590,10 @@ curl -fsS -X DELETE "http://127.0.0.1:8008/workers/${worker_id}"
 )
 ```
 
-Copy `worker_id` from `/workers` rather than constructing it manually, and raise
-`max_wait_secs` for workloads whose responses can legitimately exceed the
-default 30-minute drain window.
+Copy `worker_id` from `/workers` rather than constructing it manually; the
+snippet in [Inspect Worker State](#inspect-worker-state) prints it in a form you
+can paste directly. Raise `max_wait_secs` for workloads whose responses can
+legitimately exceed the default 30-minute drain window.
 
 Deleting a worker removes only its Router registration. Stop the worker process
 separately after the drain completes.
