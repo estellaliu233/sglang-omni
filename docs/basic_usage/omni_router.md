@@ -475,14 +475,16 @@ Use the response and health signals to choose the next step:
 | Model request: `503`, `type=overloaded_error`, `Retry-After: 1` | Router admission is full. | Back off and inspect `inflight`, `max_inflight`, and `rejected_total` in `/health`. |
 | Model request: `503`, `message=no eligible upstream` | No routable worker matches the request. | Check worker routability, model, and capabilities. |
 | Model request: `503` with `X-SGLang-Omni-Worker` | The selected worker returned `503`. | Inspect that worker's logs and `/health` endpoint. |
-| Streaming response starts with `200` but ends early | The worker failed after response headers were relayed, so the status can no longer become `502`. An SSE response ends with a terminal `upstream stream failed before completion` event whose body carries `"code": 502`; the HTTP status stays `200`. A non-SSE response, such as audio or JSON, truncates with no error frame. | Check the route-completion log for `outcome=stream_error` (a client disconnect logs `stream_cancelled` instead), then inspect the selected worker. |
+| Streaming response starts with `200` but ends early | The upstream stream failed after the HTTP status was sent. SSE responses end with an `upstream stream failed before completion` event whose body carries `"code": 502`; non-SSE streaming bodies truncate without an error frame. | Check the route-completion log for `outcome=stream_error` (a client disconnect logs `stream_cancelled` instead), then inspect the selected worker. |
 
 For admission limits, rejection logs, and capacity guidance, see
-[Overload Behavior](#overload-behavior). Selection failures contain
-`reason=no_eligible_upstream` plus the inferred model and capabilities. They
-occur before a worker is chosen and therefore have no
-`X-SGLang-Omni-Worker` header. A worker-returned `503` does not by itself evict
-the worker.
+[Overload Behavior](#overload-behavior).
+
+Selection failures contain `reason=no_eligible_upstream` plus the inferred model
+and capabilities. They occur before a worker is chosen and therefore have no
+`X-SGLang-Omni-Worker` header.
+
+A worker-returned `503` does not by itself evict the worker.
 
 ### Distinguish `502` Responses
 
