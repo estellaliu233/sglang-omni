@@ -53,6 +53,7 @@ tests/
     ├── qwen3_omni/
     │   ├── test_cli.py
     │   ├── test_code2wav.py
+    │   ├── test_code2wav_batching.py
     │   ├── test_code2wav_cuda_graph.py
     │   ├── test_colocation_config.py
     │   ├── test_config_manager.py
@@ -63,6 +64,10 @@ tests/
     │   ├── test_sglang_ar_budget.py
     │   ├── test_streaming.py
     │   ├── test_talker.py
+    │   ├── test_talker_emit_snapshot.py
+    │   ├── test_talker_feedback_write.py
+    │   ├── test_talker_row_ownership.py
+    │   ├── test_talker_token_readback.py
     │   └── test_text_template.py
     ├── ming_omni/
     │   ├── test_omni_serve.py
@@ -397,7 +402,8 @@ that happened to contain an older version of the test.
     `_rollback_decode_prep_after_skip` idempotency contract, projected prefill
     tensor storage/slicing, decode feedback/text FIFO consumption, and replay
     of generated-token input embeds after decode retract
-  - Code2Wav streaming/cleanup behavior
+  - Code2Wav streaming/cleanup behavior plus bounded batching deadlines,
+    fire rules, sub-batch decomposition, output equivalence, and lifecycle
   - Code2Wav CUDA Graph lifecycle, exact-shape replay, atomic rollback, memory
     budget enforcement, eager fallbacks, replay failures, and JSON-safe stats;
     the `gpu`-marked cases exercise real CUDA stream restoration and graph
@@ -406,7 +412,6 @@ that happened to contain an older version of the test.
     ```bash
     pytest tests/unit_test/qwen3_omni/test_code2wav_cuda_graph.py -m gpu -q
     ```
-
   - logit-shaping helpers (e.g. repetition penalty) numerical equivalence with the original per-row scalar formulas.
 
 - `unit_test/ming_omni/` Ming-Omni unit tests:
