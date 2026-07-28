@@ -11,6 +11,7 @@ the graph itself only ever does ``_cg_active_*[:bs]`` slicing — no
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import torch
@@ -21,9 +22,28 @@ from sglang_omni.models.higgs_tts.model import _flat_sampling_attr
 from sglang_omni.models.higgs_tts.sampler import K_MAX, selected_token_logprobs
 from sglang_omni.models.higgs_tts.text_tokenizer import AUDIO_PLACEHOLDER_ID
 from sglang_omni.models.higgs_tts.utils import EOC_ID
+from sglang_omni.models.higgs_tts.vocoder_scheduler import (
+    DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
+    DEFAULT_HIGGS_STREAM_STRIDE,
+    HIGGS_STREAM_FOLLOWUP_STRIDE_METADATA,
+    HIGGS_STREAM_STRIDE_METADATA,
+)
 from sglang_omni.scheduling.messages import OutgoingMessage
+from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 
 logger = logging.getLogger(__name__)
+
+
+def _syncfree_launch_enabled() -> bool:
+    """Parse SGLANG_OMNI_SYNCFREE_LAUNCH (default ON; 0/false/no disable)."""
+    value = os.environ.get("SGLANG_OMNI_SYNCFREE_LAUNCH", "1").lower()
+    if value in ("1", "true", "yes"):
+        return True
+    if value in ("0", "false", "no"):
+        return False
+    raise ValueError(
+        f'"{value}" is not a valid SGLANG_OMNI_SYNCFREE_LAUNCH boolean value'
+    )
 
 
 class HiggsTTSModelRunner(ModelRunner):
@@ -36,6 +56,11 @@ class HiggsTTSModelRunner(ModelRunner):
         # Ping-pong pinned host buffers for the async-decode rollout-logprob D2H.
         self._logprob_host_buffers: list[torch.Tensor] | None = None
         self._logprob_slot = 0
+        # Note (Yueying Li): sync-free decode launch (see _populate_cg_buffers): skip the
+        # composition-invariant sampling-param extraction/upload when the batch
+        # composition is unchanged since the previous decode step.
+        self._syncfree_launch: bool = _syncfree_launch_enabled()
+        self._cg_launch_key: tuple | None = None
 
     def _next_logprob_host_staging(self, device_buf: torch.Tensor) -> torch.Tensor:
         if self._logprob_host_buffers is None:
@@ -162,11 +187,54 @@ class HiggsTTSModelRunner(ModelRunner):
 
         model._sampler_pool.reset_row(model._padding_row)
 
+        # Note (Yueying Li): a rid absent from the pool map is a fresh acquisition: the rid may be
+        # a client-supplied reuse of a finished request's id, and LIFO row
+        # recycling makes (rid, row, bs) collide with the stale key — force a
+        # rebuild so the new request cannot inherit cached params/redirects.
+        if any(req.request_id not in model._rid_to_row for req in requests):
+            self._cg_launch_key = None
+
         rows_py: list[int] = [model.acquire_row(req.request_id) for req in requests]
-        rows_py.extend([model._padding_row] * (bs - n_real))
-        model._cg_row_indices[:bs] = torch.tensor(
-            rows_py, dtype=torch.long, device=model._cg_row_indices.device
-        )
+        # Note (Yueying Li): sync-free launch cache: temperature/top_p/top_k/row-index are
+        # per-request constants, so the four H2D uploads below (and the
+        # blocking D2H reads inside _extract_decode_sampling_params) need to
+        # rerun only when the batch composition changes. The key is
+        # order-sensitive and includes the pool rows (recomputed from
+        # acquire_row every step), so admission / finish / retract / abort /
+        # reorder / row re-allocation all miss; bs covers the padding-row
+        # count. On a hit the buffers still hold last step's values: the only
+        # other in-place writer is the lookahead done-row guard below, whose
+        # padding redirect must persist exactly as long as the finished
+        # request stays in the batch — i.e. until the key changes.
+        launch_key = (tuple(req.request_id for req in requests), tuple(rows_py), bs)
+        if not (self._syncfree_launch and launch_key == self._cg_launch_key):
+            # Note (Yueying Li): a failed rebuild must not leave a valid key
+            self._cg_launch_key = None
+            rows_full = rows_py + [model._padding_row] * (bs - n_real)
+            model._cg_row_indices[:bs] = torch.tensor(
+                rows_full, dtype=torch.long, device=model._cg_row_indices.device
+            )
+
+            temps, top_ps, top_ks = self._extract_decode_sampling_params(
+                forward_batch, n_real
+            )
+            temps.extend([1.0] * (bs - n_real))
+            top_ps.extend([1.0] * (bs - n_real))
+            model._cg_temperature[:bs] = torch.tensor(
+                temps, dtype=torch.float32, device=model._cg_temperature.device
+            )
+            model._cg_top_p[:bs] = torch.tensor(
+                top_ps, dtype=torch.float32, device=model._cg_top_p.device
+            )
+
+            top_k_vals = [
+                (tk if (tk is not None and tk > 0) else K_MAX) for tk in top_ks
+            ]
+            top_k_vals.extend([K_MAX] * (bs - n_real))
+            model._cg_top_k_buf[:bs] = torch.tensor(
+                top_k_vals, dtype=torch.long, device=model._cg_top_k_buf.device
+            )
+            self._cg_launch_key = launch_key
 
         if self._async_enabled and is_lookahead and n_real > 0:
             # Async-lookahead overrun guard (GPU-side, no host sync): a request
@@ -186,24 +254,6 @@ class HiggsTTSModelRunner(ModelRunner):
             model._cg_row_indices[:n_real] = torch.where(
                 done, torch.full_like(rows_t_real, model._padding_row), rows_t_real
             )
-
-        temps, top_ps, top_ks = self._extract_decode_sampling_params(
-            forward_batch, n_real
-        )
-        temps.extend([1.0] * (bs - n_real))
-        top_ps.extend([1.0] * (bs - n_real))
-        model._cg_temperature[:bs] = torch.tensor(
-            temps, dtype=torch.float32, device=model._cg_temperature.device
-        )
-        model._cg_top_p[:bs] = torch.tensor(
-            top_ps, dtype=torch.float32, device=model._cg_top_p.device
-        )
-
-        top_k_vals = [(tk if (tk is not None and tk > 0) else K_MAX) for tk in top_ks]
-        top_k_vals.extend([K_MAX] * (bs - n_real))
-        model._cg_top_k_buf[:bs] = torch.tensor(
-            top_k_vals, dtype=torch.long, device=model._cg_top_k_buf.device
-        )
 
         rows_t = model._cg_row_indices[:bs]
         pool = model._sampler_pool
@@ -336,14 +386,17 @@ class HiggsTTSModelRunner(ModelRunner):
             if was_done_cpu[b]:
                 cb0_per_row.append(0)
                 continue
-            codes_N = codes_BN_cpu[b].to(torch.long).clone()
-            data.output_codes.append(codes_N)
+            codes_N = self._append_output_code(data, codes_BN_cpu[b])
             if logprobs_cpu is not None and self._request_captures_rollout_logprobs(
                 sched_req
             ):
                 data.output_logprobs.append(logprobs_cpu[b].to(torch.float32).clone())
             data.generation_done = bool(gen_done_after_cpu[b])
-            self._emit_code_chunk(sched_req, codes_N)
+            self._queue_or_emit_code_chunk(
+                sched_req,
+                codes_N,
+                force=self._is_final_code_step(data),
+            )
             self._mark_sampler_finished(req, data.generation_done)
             cb0_per_row.append(int(codes_N[0].item()))
 
@@ -422,15 +475,19 @@ class HiggsTTSModelRunner(ModelRunner):
                 cb0_per_row.append(0)
                 continue
             codes_N = codes_log[-1]
-            data.output_codes.append(codes_N.detach().cpu().clone())
+            codes_cpu = self._append_output_code(data, codes_N)
             if logprobs_BN is not None and self._request_captures_rollout_logprobs(
                 sched_req
             ):
                 data.output_logprobs.append(logprobs_BN[b].detach().cpu().clone())
             data.generation_done = bool(model._sampler_pool.generation_done[row].item())
-            self._emit_code_chunk(sched_req, data.output_codes[-1])
+            self._queue_or_emit_code_chunk(
+                sched_req,
+                codes_cpu,
+                force=self._is_final_code_step(data),
+            )
             self._mark_sampler_finished(req, data.generation_done)
-            cb0_per_row.append(int(codes_N[0].item()))
+            cb0_per_row.append(int(codes_cpu[0].item()))
 
         result.next_token_ids = torch.tensor(
             cb0_per_row,
@@ -445,6 +502,44 @@ class HiggsTTSModelRunner(ModelRunner):
 
     def _should_capture_rollout_logprobs(self, requests: list) -> bool:
         return any(self._request_captures_rollout_logprobs(req) for req in requests)
+
+    @staticmethod
+    def _append_output_code(data: Any, codes_N: torch.Tensor) -> torch.Tensor:
+        try:
+            max_new_tokens = int(data.max_new_tokens)
+            num_codebooks = int(data.num_codebooks)
+            count = int(data.output_code_count)
+            buffer = data.output_code_buffer
+        except AttributeError:
+            codes_cpu = codes_N.detach().cpu().to(torch.long).clone()
+            data.output_codes.append(codes_cpu)
+            return codes_cpu
+
+        if buffer is None:
+            buffer = torch.empty(
+                (max(1, max_new_tokens), num_codebooks),
+                dtype=torch.long,
+                device="cpu",
+            )
+            data.output_code_buffer = buffer
+        elif count >= buffer.shape[0]:
+            new_cap = max(count + 1, buffer.shape[0] * 2)
+            new_buffer = torch.empty(
+                (new_cap, num_codebooks),
+                dtype=torch.long,
+                device="cpu",
+            )
+            new_buffer[:count].copy_(buffer[:count])
+            buffer = new_buffer
+            data.output_code_buffer = buffer
+
+        row = buffer[count]
+        if codes_N.device.type == "cpu" and codes_N.dtype == torch.long:
+            row.copy_(codes_N)
+        else:
+            row.copy_(codes_N.detach().to(device="cpu", dtype=torch.long))
+        data.output_code_count = count + 1
+        return row
 
     def _decode_step_logprobs(self, result: Any, n_real: int) -> torch.Tensor:
         model = self.model
@@ -512,6 +607,110 @@ class HiggsTTSModelRunner(ModelRunner):
         """Bridge Higgs sampler completion into upstream SGLang finish state."""
         if generation_done and req.finished_reason is None:
             req.finished_reason = FINISH_MATCHED_TOKEN(EOC_ID)
+
+    @staticmethod
+    def _is_final_code_step(data: Any) -> bool:
+        if bool(data.generation_done):
+            return True
+        try:
+            max_new_tokens = int(data.max_new_tokens or 0)
+        except AttributeError:
+            return False
+        try:
+            output_count = int(data.output_code_count)
+        except AttributeError:
+            output_count = len(data.output_codes)
+        return max_new_tokens > 0 and output_count >= max_new_tokens
+
+    def _queue_or_emit_code_chunk(
+        self, sched_req: Any, codes_N: torch.Tensor, *, force: bool = False
+    ) -> None:
+        if self._outbox is None:
+            return
+        data = sched_req.data
+        if data.stream_metadata is None:
+            return
+
+        data.stream_code_buffer.append(codes_N)
+        data.stream_code_seen_rows += 1
+        if int(data.stream_code_next_flush_rows) <= 0:
+            data.stream_code_next_flush_rows = self._initial_stream_flush_rows(data)
+        if force or data.stream_code_seen_rows >= data.stream_code_next_flush_rows:
+            self._flush_code_chunks(sched_req, force=force)
+
+    @staticmethod
+    def _stream_params(data: Any) -> tuple[int, int, int, int]:
+        num_codebooks = max(int(data.num_codebooks or 1), 1)
+        metadata = data.stream_metadata or {}
+        stride = max(
+            int(
+                metadata.get(HIGGS_STREAM_STRIDE_METADATA, DEFAULT_HIGGS_STREAM_STRIDE)
+            ),
+            1,
+        )
+        followup = max(
+            int(
+                metadata.get(
+                    HIGGS_STREAM_FOLLOWUP_STRIDE_METADATA,
+                    DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
+                )
+            ),
+            1,
+        )
+        initial_frames = metadata.get(INITIAL_CODEC_CHUNK_FRAMES_PARAM)
+        if initial_frames is None:
+            return num_codebooks, stride, followup, 0
+        try:
+            initial_frames_i = int(initial_frames)
+        except (TypeError, ValueError):
+            initial_frames_i = 0
+        if initial_frames_i <= 0:
+            return num_codebooks, stride, followup, 0
+        steady_codec_frames = max(1, stride - num_codebooks + 1)
+        return (
+            num_codebooks,
+            stride,
+            followup,
+            min(initial_frames_i, steady_codec_frames),
+        )
+
+    @classmethod
+    def _initial_stream_flush_rows(cls, data: Any) -> int:
+        num_codebooks, stride, _, initial_frames = cls._stream_params(data)
+        steady_codec_frames = max(1, stride - num_codebooks + 1)
+        if 0 < initial_frames < steady_codec_frames:
+            return max(num_codebooks, initial_frames + num_codebooks - 1)
+        return max(num_codebooks, stride)
+
+    @classmethod
+    def _next_stream_flush_rows(cls, data: Any, flushed_rows: int) -> int:
+        num_codebooks, stride, followup, initial_frames = cls._stream_params(data)
+        steady_codec_frames = max(1, stride - num_codebooks + 1)
+        emitted_initial_chunk = (
+            not bool(data.stream_code_first_flush_done)
+            and 0 < initial_frames < steady_codec_frames
+        )
+        if emitted_initial_chunk:
+            return max(num_codebooks, stride) + followup
+        return int(flushed_rows) + followup
+
+    def _flush_code_chunks(self, sched_req: Any, *, force: bool = False) -> None:
+        data = sched_req.data
+        rows = data.stream_code_buffer
+        if not rows:
+            return
+        if len(rows) == 1:
+            payload = rows[0]
+        else:
+            payload = torch.stack(rows, dim=0)
+        flushed_rows = int(data.stream_code_seen_rows)
+        if not force:
+            data.stream_code_next_flush_rows = self._next_stream_flush_rows(
+                data, flushed_rows
+            )
+        data.stream_code_buffer = []
+        data.stream_code_first_flush_done = True
+        self._emit_code_chunk(sched_req, payload)
 
     def _emit_code_chunk(self, sched_req: Any, codes_N: torch.Tensor) -> None:
         if self._outbox is None:

@@ -7,7 +7,13 @@ from typing import ClassVar
 
 from pydantic import Field
 
-from sglang_omni.config import PipelineConfig, PlacementConfig, StageConfig
+from sglang_omni.config import (
+    PipelineConfig,
+    PlacementConfig,
+    StageConfig,
+    StageResourceConfig,
+    StageRuntimeConfig,
+)
 
 _PKG = "sglang_omni.models.qwen3_omni"
 _PLACEMENT_POLICY = f"{_PKG}.placement.Qwen3OmniPlacementPolicy"
@@ -20,6 +26,16 @@ MIN_PARTIAL_START_CHUNKS = 3
 # FIXME (Ratish): Replace this with a bounded/pre-ready SGLang DeepGEMM compile
 # policy once that exists outside import-time environment globals.
 _DEEPGEMM_PRECOMPILE_ENV_DEFAULTS = {"SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0"}
+
+# A colocated worker launches eight stage processes. Letting every PyTorch
+# process size its OpenMP pool to the full host oversubscribes launch-side CPU
+# work when multiple workers share a node. Preprocessing handles one prompt per
+# scheduler call, so a host-wide tokenizer Rayon pool only adds contention.
+_COLOCATED_STAGE_ENV_DEFAULTS = {
+    **_DEEPGEMM_PRECOMPILE_ENV_DEFAULTS,
+    "OMP_NUM_THREADS": "8",
+    "TOKENIZERS_PARALLELISM": "false",
+}
 
 
 def _preprocessing_stage(*, process: str) -> StageConfig:
@@ -76,7 +92,9 @@ def _audio_encoder_stage(*, gpu: int, process: str) -> StageConfig:
     )
 
 
-def _aggregate_stage(*, process: str, speech_enabled: bool = False) -> StageConfig:
+def _aggregate_stage(
+    *, process: str, gpu: int, speech_enabled: bool = False
+) -> StageConfig:
     # Route the merged payload to talker_ar so partial-start can fire — the
     # policy hook needs the new_request before `stream_done` arrives.
     if speech_enabled:
@@ -84,11 +102,13 @@ def _aggregate_stage(*, process: str, speech_enabled: bool = False) -> StageConf
             name="mm_aggregate",
             process=process,
             factory=f"{_PKG}.stages.create_aggregate_executor",
+            gpu=gpu,
             wait_for=["preprocessing", "image_encoder", "audio_encoder"],
             wait_for_fn=f"{_PKG}.request_builders.resolve_mm_aggregate_wait_sources",
             merge_fn=f"{_PKG}.merge.merge_for_thinker",
             next=["thinker", "talker_ar"],
             route_fn=f"{_PKG}.request_builders.resolve_mm_aggregate_next_stages",
+            disable_direct_cuda_ipc_payload=True,
             project_payload={
                 "talker_ar": (
                     f"{_PKG}.request_builders.project_mm_aggregate_to_talker_ar"
@@ -99,10 +119,12 @@ def _aggregate_stage(*, process: str, speech_enabled: bool = False) -> StageConf
         name="mm_aggregate",
         process=process,
         factory=f"{_PKG}.stages.create_aggregate_executor",
+        gpu=gpu,
         wait_for=["preprocessing", "image_encoder", "audio_encoder"],
         wait_for_fn=f"{_PKG}.request_builders.resolve_mm_aggregate_wait_sources",
         merge_fn=f"{_PKG}.merge.merge_for_thinker",
         next="thinker",
+        disable_direct_cuda_ipc_payload=True,
     )
 
 
@@ -186,8 +208,11 @@ def _code2wav_stage(*, gpu: int, process: str) -> StageConfig:
         name="code2wav",
         process=process,
         factory=f"{_PKG}.components.code2wav_scheduler.create_code2wav_scheduler",
-        factory_args={"device": "cuda"},
+        factory_args={"device": "cuda", "enable_cuda_graph": True},
         gpu=gpu,
+        runtime=StageRuntimeConfig(
+            resources=StageResourceConfig(total_gpu_memory_fraction=0.02)
+        ),
         terminal=True,
         can_accept_stream_before_payload=True,
     )
@@ -198,7 +223,7 @@ def _text_stages() -> list[StageConfig]:
         _preprocessing_stage(process="pipeline"),
         _image_encoder_stage(gpu=0, process="pipeline"),
         _audio_encoder_stage(gpu=0, process="pipeline"),
-        _aggregate_stage(process="pipeline", speech_enabled=False),
+        _aggregate_stage(process="pipeline", gpu=0, speech_enabled=False),
         _thinker_stage(gpu=0, speech_enabled=False, process="pipeline"),
         _decode_stage(process="pipeline"),
     ]
@@ -223,6 +248,7 @@ def _speech_stages(
         ),
         _aggregate_stage(
             process=process_by_stage["mm_aggregate"],
+            gpu=thinker_gpu,
             speech_enabled=True,
         ),
         _thinker_stage(
@@ -341,6 +367,10 @@ class Qwen3OmniSpeechColocatedPipelineConfig(Qwen3OmniSpeechPipelineConfig):
     config file so deployments can use hardware-appropriate stage fractions and
     SGLang AR cache fractions.
     """
+
+    env_defaults: dict[str, str] = Field(
+        default_factory=lambda: dict(_COLOCATED_STAGE_ENV_DEFAULTS)
+    )
 
     stages: list[StageConfig] = Field(
         default_factory=lambda: _speech_stages(

@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import pytest
 
-from sglang_omni.config import build_process_topology_plan, build_stage_placement_plan
+from sglang_omni.config import (
+    build_process_topology_plan,
+    build_stage_placement_plan,
+    resolve_stage_factory_args,
+)
 from sglang_omni.models.qwen3_omni.config import (
     Qwen3OmniSpeechColocatedPipelineConfig,
     Qwen3OmniSpeechPipelineConfig,
@@ -43,11 +47,19 @@ def _set_colocated_runtime(
 
 def test_default_speech_topology_stays_disaggregated() -> None:
     config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
+    code2wav = _stage(config, "code2wav")
+    code2wav_args = resolve_stage_factory_args(code2wav, config)
 
     assert len(config.stages) == 8
     assert _stage(config, "thinker").gpu == 0
     assert _stage(config, "talker_ar").gpu == 1
-    assert _stage(config, "code2wav").gpu == 1
+    assert code2wav.gpu == 1
+    assert code2wav_args["enable_cuda_graph"] is True
+    assert code2wav_args["total_gpu_memory_fraction"] == pytest.approx(0.02)
+    assert "enable_batching" not in code2wav.factory_args
+    assert "max_batch_wait_ms" not in code2wav.factory_args
+    assert "batch_floor" not in code2wav.factory_args
+    assert "batch_ceiling" not in code2wav.factory_args
     assert _stage(config, "talker_ar").factory_args["enable_partial_start"] is True
     assert config.placement.require_memory_fraction_for_colocation is False
     assert {stage.name: stage.process for stage in config.stages} == {
@@ -115,23 +127,27 @@ def test_colocated_config_passes_with_explicit_budgets_without_ar_mem_fraction()
     ]
 
 
-def test_colocated_config_marks_same_gpu_stream_targets() -> None:
+def test_colocated_config_places_ar_chain_on_one_gpu() -> None:
     config = Qwen3OmniSpeechColocatedPipelineConfig(model_path="dummy")
     _set_colocated_runtime(config)
 
     plan = build_stage_placement_plan(config)
 
-    assert plan.same_gpu_stream_targets["thinker"] == frozenset({"talker_ar"})
-    assert plan.same_gpu_stream_targets["talker_ar"] == frozenset({"code2wav"})
+    # Colocated: thinker -> talker_ar -> code2wav all share GPU 0.
+    assert plan.stages["thinker"].gpu_ids == (0,)
+    assert plan.stages["talker_ar"].gpu_ids == (0,)
+    assert plan.stages["code2wav"].gpu_ids == (0,)
 
 
-def test_default_speech_marks_only_talker_to_code2wav_same_gpu_stream() -> None:
+def test_default_speech_splits_thinker_from_talker_chain() -> None:
     config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
 
     plan = build_stage_placement_plan(config)
 
-    assert "thinker" not in plan.same_gpu_stream_targets
-    assert plan.same_gpu_stream_targets["talker_ar"] == frozenset({"code2wav"})
+    # Default: thinker on its own GPU, talker_ar -> code2wav colocated on another.
+    assert plan.stages["thinker"].gpu_ids == (0,)
+    assert plan.stages["talker_ar"].gpu_ids == (1,)
+    assert plan.stages["code2wav"].gpu_ids == (1,)
 
 
 def test_colocated_config_rejects_conflicting_ar_mem_fraction() -> None:

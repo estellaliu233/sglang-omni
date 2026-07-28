@@ -40,7 +40,7 @@ def _rematerialize_audio_decoder_buffers(
 
 def patch_fish_config_for_sglang() -> None:
     """Patch Fish config classes with the aliases SGLang expects."""
-    from sglang_omni.models.fishaudio_s2_pro.fish_speech.models.text2semantic.modeling import (
+    from sglang_omni.models.fishaudio_s2_pro.fish_speech.models.text2semantic.configuration import (
         FishQwen3Config,
         FishQwen3OmniConfig,
     )
@@ -74,12 +74,17 @@ def patch_fish_config_for_sglang() -> None:
 
 
 def truncate_rope_to_bf16(model: torch.nn.Module) -> None:
-    """Match the old Fish runtime's rope-cache precision behavior."""
-    for module in model.modules():
-        if hasattr(module, "cos_sin_cache"):
-            module.cos_sin_cache.data = module.cos_sin_cache.data.to(torch.bfloat16).to(
-                torch.float32
-            )
+    """Match the old Fish runtime's rope-cache precision behavior.
+
+    In-place, idempotent, and deterministic on purpose: this runs after the
+    weight-share export, so rebinding the buffer would orphan attached
+    followers, while an in-place write lands identically for every replica.
+    """
+    with torch.no_grad():
+        for module in model.modules():
+            if hasattr(module, "cos_sin_cache"):
+                cache = module.cos_sin_cache
+                cache.copy_(cache.to(torch.bfloat16).to(cache.dtype))
 
 
 def load_audio_decoder(
@@ -90,31 +95,38 @@ def load_audio_decoder(
     """Load the Fish audio decoder and return it with metadata + tokenizer."""
     from transformers import PreTrainedTokenizerFast
 
+    from sglang_omni.models.fishaudio_s2_pro.fish_speech.models.text2semantic.audio_decoder import (
+        FishQwen3AudioDecoder,
+    )
     from sglang_omni.models.fishaudio_s2_pro.fish_speech.models.text2semantic.configuration import (
         FishQwen3OmniConfig,
     )
-    from sglang_omni.models.fishaudio_s2_pro.fish_speech.models.text2semantic.modeling import (
-        FishQwen3OmniForCausalLM,
-    )
+    from sglang_omni.models.weight_loader import load_module
 
     logger.info(f"Loading Fish audio decoder from {checkpoint_dir}")
     start = time.perf_counter()
 
     config = FishQwen3OmniConfig.from_pretrained(checkpoint_dir)
-    model = FishQwen3OmniForCausalLM.from_pretrained(checkpoint_dir, config=config)
-    model = model.to(dtype=torch.bfloat16).eval()
+    if config.audio_decoder_config is None:
+        raise RuntimeError("Fish checkpoint config does not define an audio decoder")
 
-    audio_decoder = model.audio_decoder
-    if audio_decoder is None:
-        raise RuntimeError("Fish checkpoint did not contain an audio decoder")
-    audio_decoder = audio_decoder.to(device=device)
+    with torch.device("meta"):
+        audio_decoder = FishQwen3AudioDecoder(config.audio_decoder_config)
+    audio_decoder = load_module(
+        audio_decoder,
+        checkpoint_dir,
+        prefix="audio_decoder.",
+        strict=True,
+    )
+    # note (xinyu): Meta construction leaves non-persistent buffers on meta after strict
+    # parameter assignment. Rebuild them before moving the module to its device.
     _rematerialize_audio_decoder_buffers(audio_decoder, device)
+    audio_decoder = audio_decoder.to(device=device, dtype=torch.bfloat16).eval()
 
     tokenizer = PreTrainedTokenizerFast.from_pretrained(checkpoint_dir)
     num_codebooks = int(config.audio_decoder_config.num_codebooks)
     codebook_size = int(config.audio_decoder_config.vocab_size)
 
-    del model
     if str(device).startswith("cuda"):
         torch.cuda.empty_cache()
 
