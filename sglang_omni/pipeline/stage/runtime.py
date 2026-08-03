@@ -1559,7 +1559,31 @@ class Stage:
 
     def _on_profiler_start(self, msg: ProfilerStartMessage) -> None:
         run_id = msg.run_id
-        if msg.enable_torch and not TorchProfiler.is_active():
+        scheduler_thread_torch = (
+            os.environ.get("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD") == "1"
+        )
+        if msg.enable_torch and scheduler_thread_torch:
+            base_tpl = msg.trace_path_template.format(run_id=run_id, stage=self.name)
+            template = f"{base_tpl}_pid{os.getpid()}"
+            prof_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
+            if prof_dir and not os.path.isabs(template):
+                template = os.path.join(prof_dir, template)
+            # Kineto CPU operator callbacks are thread-local. The AR scheduler
+            # runs in a dedicated thread that predates this control message, so
+            # starting here on the asyncio thread records CUDA activities but
+            # no CPU-side Aten operators. Route the opt-in profiler lifecycle
+            # through OmniScheduler's admin queue so start/stop execute on the
+            # actual compute thread. Only that scheduler owns the process-wide
+            # TorchProfiler singleton; sibling stages still participate in the
+            # event recorder below.
+            if self.name == "tts_engine" and hasattr(self.scheduler, "admin"):
+                response = self.scheduler.admin(
+                    "torch_profiler_start",
+                    {"trace_path_template": template, "run_id": run_id},
+                )
+                if not response.get("success", False):
+                    raise RuntimeError(response.get("error", response.get("message")))
+        elif msg.enable_torch and not TorchProfiler.is_active():
             base_tpl = msg.trace_path_template.format(run_id=run_id, stage=self.name)
             template = f"{base_tpl}_pid{os.getpid()}"
             prof_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
@@ -1580,7 +1604,19 @@ class Stage:
 
     def _on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
         # run_id=None is a wildcard (stop whatever's active).
-        if TorchProfiler.is_active() and (
+        scheduler_thread_torch = (
+            os.environ.get("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD") == "1"
+        )
+        if scheduler_thread_torch:
+            if self.name == "tts_engine" and hasattr(self.scheduler, "admin"):
+                response = self.scheduler.admin(
+                    "torch_profiler_stop", {"run_id": msg.run_id}
+                )
+                if not response.get("success", False):
+                    raise RuntimeError(
+                        response.get("error", response.get("message"))
+                    )
+        elif TorchProfiler.is_active() and (
             msg.run_id is None or TorchProfiler.get_active_run_id() == msg.run_id
         ):
             TorchProfiler.stop(run_id=msg.run_id)

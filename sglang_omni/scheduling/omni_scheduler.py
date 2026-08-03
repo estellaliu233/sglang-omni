@@ -1599,6 +1599,18 @@ class OmniScheduler:
         self, action: str, payload: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         payload = dict(payload or {})
+        if action == "torch_profiler_start":
+            from sglang_omni.profiler.torch_profiler import TorchProfiler
+
+            trace = TorchProfiler.start(
+                str(payload["trace_path_template"]), run_id=payload.get("run_id")
+            )
+            return {"success": True, "trace": trace}
+        if action == "torch_profiler_stop":
+            from sglang_omni.profiler.torch_profiler import TorchProfiler
+
+            result = TorchProfiler.stop(run_id=payload.get("run_id"))
+            return {"success": True, "result": result}
         if action == ADMIN_MODEL_INFO:
             return self._admin_model_info()
         if action == ADMIN_PAUSE_GENERATION:
