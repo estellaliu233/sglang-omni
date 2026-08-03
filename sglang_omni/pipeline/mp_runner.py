@@ -204,10 +204,7 @@ def _validate_torch_profiler_owners(groups: list[StageGroup]) -> None:
                 )
             owners.extend(process_owners)
 
-    if (
-        os.environ.get("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD") == "1"
-        and not owners
-    ):
+    if os.environ.get("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD") == "1" and not owners:
         raise ValueError(
             "SGLANG_TORCH_PROFILER_SCHEDULER_THREAD=1 requires at least one "
             "stage with runtime.torch_profiler_owner=true"

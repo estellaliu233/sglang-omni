@@ -1627,9 +1627,7 @@ class Stage:
             if self._torch_profiler_owner:
                 response = self.scheduler.stop_torch_profiler(msg.run_id)
                 if not response.get("success", False):
-                    raise RuntimeError(
-                        response.get("error", response.get("message"))
-                    )
+                    raise RuntimeError(response.get("error", response.get("message")))
         elif TorchProfiler.is_active() and (
             msg.run_id is None or TorchProfiler.get_active_run_id() == msg.run_id
         ):
