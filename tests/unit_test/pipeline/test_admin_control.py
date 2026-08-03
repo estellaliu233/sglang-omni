@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import queue
 import threading
 import time
 from types import SimpleNamespace
+
+import pytest
 
 from sglang_omni.pipeline.control_plane import deserialize_message, serialize_message
 from sglang_omni.pipeline.coordinator import Coordinator
@@ -16,6 +19,8 @@ from sglang_omni.proto import (
     AdminOperation,
     AdminResult,
     AdminResultMessage,
+    ProfilerStartMessage,
+    ProfilerStopMessage,
     parse_message,
 )
 from tests.unit_test.fixtures.pipeline_fakes import (
@@ -35,6 +40,20 @@ class AdminScheduler(FakeScheduler):
     def admin(self, action: str, payload: dict):
         self.calls.append((action, payload))
         return {"success": True, "message": "ok", "data": {"action": action}}
+
+
+class ProfilerControlScheduler(FakeScheduler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.profiler_calls: list[tuple] = []
+
+    def start_torch_profiler(self, trace_path_template: str, run_id: str | None):
+        self.profiler_calls.append(("start", trace_path_template, run_id))
+        return {"success": True}
+
+    def stop_torch_profiler(self, run_id: str | None):
+        self.profiler_calls.append(("stop", run_id))
+        return {"success": True}
 
 
 def test_admin_messages_round_trip() -> None:
@@ -474,3 +493,53 @@ def test_stage_admin_dispatches_to_scheduler() -> None:
         assert result_msg.result.data["action"] == "pause_generation"
 
     asyncio.run(_run())
+
+
+def test_stage_routes_torch_profiler_to_explicit_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD", "1")
+    scheduler = ProfilerControlScheduler()
+    stage = Stage(
+        name="ar-with-an-arbitrary-name",
+        role="single",
+        get_next=lambda request_id, output: None,
+        gpu_id=None,
+        endpoints={},
+        control_plane=RecordingStageControlPlane(),
+        relay=FakeRelay(),
+        scheduler=scheduler,
+        torch_profiler_owner=True,
+    )
+
+    stage._on_profiler_start(
+        ProfilerStartMessage(
+            run_id="run-1",
+            trace_path_template="/tmp/{run_id}/{stage}/trace",
+        )
+    )
+    stage._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
+
+    assert scheduler.profiler_calls == [
+        (
+            "start",
+            f"/tmp/run-1/ar-with-an-arbitrary-name/trace_pid{os.getpid()}",
+            "run-1",
+        ),
+        ("stop", "run-1"),
+    ]
+
+
+def test_stage_rejects_profiler_owner_without_control_capability() -> None:
+    with pytest.raises(TypeError, match="does not implement"):
+        Stage(
+            name="decode",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={},
+            control_plane=RecordingStageControlPlane(),
+            relay=FakeRelay(),
+            scheduler=FakeScheduler(),
+            torch_profiler_owner=True,
+        )

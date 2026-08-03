@@ -13,11 +13,49 @@ from sglang_omni.config.schema import (
 from sglang_omni.pipeline.mp_runner import (
     _build_stage_groups,
     _resolve_same_process_targets,
+    _validate_torch_profiler_owners,
 )
 from sglang_omni.pipeline.runtime_config import prepare_pipeline_runtime
-from sglang_omni.pipeline.stage_workers import get_stage_process_env
+from sglang_omni.pipeline.stage_workers import (
+    StageGroup,
+    StageLaunchConfig,
+    StageWorkerProcessSpec,
+    get_stage_process_env,
+)
 from tests.unit_test.fixtures.pipeline_fakes import FakeMpContext, fake_factory_path
 from tests.unit_test.pipeline.helpers import stage
+
+
+def _profiler_owner_group(*owners: str) -> StageGroup:
+    return StageGroup(
+        "test",
+        [
+            StageWorkerProcessSpec(
+                process_name="shared",
+                stage_specs=[
+                    StageLaunchConfig(
+                        stage_name=name,
+                        torch_profiler_owner=True,
+                    )
+                    for name in owners
+                ],
+            )
+        ],
+    )
+
+
+def test_torch_profiler_owner_is_unique_per_process() -> None:
+    with pytest.raises(ValueError, match="multiple Torch profiler owners"):
+        _validate_torch_profiler_owners([_profiler_owner_group("a", "b")])
+
+
+def test_scheduler_thread_profiling_requires_an_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD", "1")
+
+    with pytest.raises(ValueError, match="requires at least one stage"):
+        _validate_torch_profiler_owners([_profiler_owner_group()])
 
 
 def test_pipeline_schema_keeps_topology_and_validation_contracts() -> None:

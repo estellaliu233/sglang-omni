@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from sglang_omni.config import PipelineConfig, StageConfig
+from sglang_omni.config import PipelineConfig, StageConfig, StageRuntimeConfig
 
 _PKG = "sglang_omni.models.moss_tts"
 
@@ -70,6 +70,7 @@ class MossTTSPipelineConfig(PipelineConfig):
             factory=f"{_PKG}.stages.create_sglang_tts_engine_executor",
             factory_args={"dtype": "bfloat16"},
             gpu=0,
+            runtime=StageRuntimeConfig(torch_profiler_owner=True),
             next="vocoder",
         ),
         StageConfig(

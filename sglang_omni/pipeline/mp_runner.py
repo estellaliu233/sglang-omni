@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import multiprocessing
+import os
 import socket
 from typing import Any
 
@@ -128,6 +129,7 @@ def _build_stage_groups(
             is_stream_receiver=stage_cfg.name in stream_receivers,
             can_accept_stream_before_payload=stage_cfg.can_accept_stream_before_payload,
             disable_direct_cuda_ipc_payload=stage_cfg.disable_direct_cuda_ipc_payload,
+            torch_profiler_owner=stage_cfg.runtime.torch_profiler_owner,
             name_map=name_map,
         )
         if tp_size == 1:
@@ -178,9 +180,38 @@ def _build_stage_groups(
             )
         )
     groups.extend(tp_groups)
+    _validate_torch_profiler_owners(groups)
     _attach_process_memory_fraction_defaults(groups)
 
     return groups
+
+
+def _validate_torch_profiler_owners(groups: list[StageGroup]) -> None:
+    """Require one process-local owner at most for the profiler singleton."""
+
+    owners: list[str] = []
+    for group in groups:
+        for process_spec in group.process_specs:
+            process_owners = [
+                stage.stage_name
+                for stage in process_spec.stage_specs
+                if stage.torch_profiler_owner
+            ]
+            if len(process_owners) > 1:
+                raise ValueError(
+                    f"Process {process_spec.process_name!r} has multiple Torch "
+                    f"profiler owners: {process_owners}"
+                )
+            owners.extend(process_owners)
+
+    if (
+        os.environ.get("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD") == "1"
+        and not owners
+    ):
+        raise ValueError(
+            "SGLANG_TORCH_PROFILER_SCHEDULER_THREAD=1 requires at least one "
+            "stage with runtime.torch_profiler_owner=true"
+        )
 
 
 def _attach_process_memory_fraction_defaults(groups: list[StageGroup]) -> None:

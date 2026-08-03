@@ -15,7 +15,7 @@ import os
 import queue as _queue_mod
 import threading
 from contextlib import suppress
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal, Protocol, runtime_checkable
 
 import torch
 
@@ -52,6 +52,18 @@ logger = logging.getLogger(__name__)
 
 GetNextFn = Callable[[str, Any], str | list[str] | None]
 GetStreamDoneTargetsFn = Callable[[str, Any], str | list[str] | None]
+_SCHEDULER_THREAD_PROFILER_ENV = "SGLANG_TORCH_PROFILER_SCHEDULER_THREAD"
+
+
+@runtime_checkable
+class SchedulerThreadProfilerControl(Protocol):
+    """Scheduler capability for thread-local profiler lifecycle control."""
+
+    def start_torch_profiler(
+        self, trace_path_template: str, run_id: str | None
+    ) -> dict[str, Any]: ...
+
+    def stop_torch_profiler(self, run_id: str | None) -> dict[str, Any]: ...
 
 
 def _error_text(exc: BaseException) -> str:
@@ -100,6 +112,7 @@ class Stage:
         disable_direct_cuda_ipc_payload: bool = False,
         tp_fanout: TPLeaderFanout | None = None,
         is_terminal: bool = False,
+        torch_profiler_owner: bool = False,
     ):
         self.name = name
         self.role = role
@@ -118,7 +131,17 @@ class Stage:
         self._disable_direct_cuda_ipc_payload = disable_direct_cuda_ipc_payload
         self._tp_fanout = tp_fanout
         self._is_terminal = is_terminal
+        self._torch_profiler_owner = torch_profiler_owner
         self._owns_external_io = role in {"single", "leader"}
+
+        if self._torch_profiler_owner and not isinstance(
+            scheduler, SchedulerThreadProfilerControl
+        ):
+            raise TypeError(
+                f"Stage {name!r} is configured as the Torch profiler owner, "
+                "but its scheduler does not implement scheduler-thread "
+                "profiler control"
+            )
 
         self._comm = CommEngine(
             CommRouter(
@@ -1559,9 +1582,7 @@ class Stage:
 
     def _on_profiler_start(self, msg: ProfilerStartMessage) -> None:
         run_id = msg.run_id
-        scheduler_thread_torch = (
-            os.environ.get("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD") == "1"
-        )
+        scheduler_thread_torch = os.environ.get(_SCHEDULER_THREAD_PROFILER_ENV) == "1"
         if msg.enable_torch and scheduler_thread_torch:
             base_tpl = msg.trace_path_template.format(run_id=run_id, stage=self.name)
             template = f"{base_tpl}_pid{os.getpid()}"
@@ -1573,14 +1594,11 @@ class Stage:
             # starting here on the asyncio thread records CUDA activities but
             # no CPU-side Aten operators. Route the opt-in profiler lifecycle
             # through OmniScheduler's admin queue so start/stop execute on the
-            # actual compute thread. Only that scheduler owns the process-wide
-            # TorchProfiler singleton; sibling stages still participate in the
-            # event recorder below.
-            if self.name == "tts_engine" and hasattr(self.scheduler, "admin"):
-                response = self.scheduler.admin(
-                    "torch_profiler_start",
-                    {"trace_path_template": template, "run_id": run_id},
-                )
+            # actual compute thread. Ownership is explicit runtime intent,
+            # independent of a model-specific stage name. Sibling stages still
+            # participate in the event recorder below.
+            if self._torch_profiler_owner:
+                response = self.scheduler.start_torch_profiler(template, run_id)
                 if not response.get("success", False):
                     raise RuntimeError(response.get("error", response.get("message")))
         elif msg.enable_torch and not TorchProfiler.is_active():
@@ -1604,14 +1622,10 @@ class Stage:
 
     def _on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
         # run_id=None is a wildcard (stop whatever's active).
-        scheduler_thread_torch = (
-            os.environ.get("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD") == "1"
-        )
+        scheduler_thread_torch = os.environ.get(_SCHEDULER_THREAD_PROFILER_ENV) == "1"
         if scheduler_thread_torch:
-            if self.name == "tts_engine" and hasattr(self.scheduler, "admin"):
-                response = self.scheduler.admin(
-                    "torch_profiler_stop", {"run_id": msg.run_id}
-                )
+            if self._torch_profiler_owner:
+                response = self.scheduler.stop_torch_profiler(msg.run_id)
                 if not response.get("success", False):
                     raise RuntimeError(
                         response.get("error", response.get("message"))
