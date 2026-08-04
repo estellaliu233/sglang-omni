@@ -1640,11 +1640,7 @@ class Stage:
         mode = self._torch_profiler_mode()
         route_to_scheduler = mode == _TORCH_PROFILER_SCHEDULER_OWNER
         skip_torch = mode == _TORCH_PROFILER_SCHEDULER_SIBLING
-        if (
-            msg.enable_torch
-            and not skip_torch
-            and (route_to_scheduler or not TorchProfiler.is_active())
-        ):
+        if msg.enable_torch and not skip_torch:
             base_tpl = msg.trace_path_template.format(run_id=run_id, stage=self.name)
             template = f"{base_tpl}_pid{os.getpid()}"
             prof_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")

@@ -623,6 +623,34 @@ def test_ownerless_process_still_profiles_directly(
     assert scheduler.profiler_calls == []
 
 
+def test_ownerless_process_forwards_a_new_run_to_the_profiler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The process-wide singleton decides whether a start is idempotent or
+    replaces an active run. The stage must not hide a different run from it."""
+    monkeypatch.setenv("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD", "1")
+    direct_calls: list[tuple] = []
+    _patch_direct_torch_profiler(monkeypatch, direct_calls)
+
+    scheduler = ProfilerControlScheduler()
+    stage = _profiler_stage(
+        scheduler, name="vocoder", owner=False, process_has_owner=False
+    )
+
+    stage._on_profiler_start(
+        ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace")
+    )
+    stage._on_profiler_start(
+        ProfilerStartMessage(run_id="run-2", trace_path_template="/tmp/{stage}/trace")
+    )
+
+    assert direct_calls == [
+        ("start", f"/tmp/vocoder/trace_pid{os.getpid()}", "run-1"),
+        ("start", f"/tmp/vocoder/trace_pid{os.getpid()}", "run-2"),
+    ]
+    assert scheduler.profiler_calls == []
+
+
 def test_colocated_sibling_never_touches_the_profiler_singleton(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
