@@ -180,14 +180,30 @@ def _build_stage_groups(
             )
         )
     groups.extend(tp_groups)
-    _validate_torch_profiler_owners(groups)
+    _resolve_torch_profiler_ownership(groups)
     _attach_process_memory_fraction_defaults(groups)
 
     return groups
 
 
-def _validate_torch_profiler_owners(groups: list[StageGroup]) -> None:
-    """Require one process-local owner at most for the profiler singleton."""
+def _resolve_torch_profiler_ownership(groups: list[StageGroup]) -> None:
+    """Resolve profiler ownership per OS process and stamp it on each stage.
+
+    ``TorchProfiler`` is a process-wide singleton, but one OS process can host
+    several stages sharing a single asyncio loop (see ``_run_process``). So
+    ownership is a property of the process, not of a stage:
+
+    - a process with an owner: only that owner drives the singleton, through
+      its scheduler thread. Its colocated siblings must keep their hands off,
+      otherwise whoever handles the broadcast first wins the race and the
+      profiler ends up started (or stopped) on the wrong thread.
+    - a process without an owner: every stage keeps the pre-existing direct
+      path, so a partial rollout never silently drops that process's trace.
+
+    A globally ownerless pipeline under
+    ``SGLANG_TORCH_PROFILER_SCHEDULER_THREAD=1`` is rejected, since the flag
+    would then be a no-op.
+    """
 
     owners: list[str] = []
     for group in groups:
@@ -202,6 +218,8 @@ def _validate_torch_profiler_owners(groups: list[StageGroup]) -> None:
                     f"Process {process_spec.process_name!r} has multiple Torch "
                     f"profiler owners: {process_owners}"
                 )
+            for stage_spec in process_spec.stage_specs:
+                stage_spec.torch_profiler_process_has_owner = bool(process_owners)
             owners.extend(process_owners)
 
     if os.environ.get("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD") == "1" and not owners:

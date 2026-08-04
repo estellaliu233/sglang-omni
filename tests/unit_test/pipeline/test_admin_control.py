@@ -5,14 +5,17 @@ from __future__ import annotations
 import asyncio
 import os
 import queue
+import sys
 import threading
 import time
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
 from sglang_omni.pipeline.control_plane import deserialize_message, serialize_message
 from sglang_omni.pipeline.coordinator import Coordinator
+from sglang_omni.pipeline.stage import runtime as runtime_mod
 from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.proto import (
     AdminMessage,
@@ -43,17 +46,66 @@ class AdminScheduler(FakeScheduler):
 
 
 class ProfilerControlScheduler(FakeScheduler):
-    def __init__(self) -> None:
+    def __init__(self, *, thread_ready: bool = True, succeed: bool = True) -> None:
         super().__init__()
         self.profiler_calls: list[tuple] = []
+        self._thread_ready = thread_ready
+        self._succeed = succeed
+
+    def _response(self) -> dict:
+        if self._succeed:
+            return {"success": True}
+        return {"success": False, "error": "kineto unavailable"}
+
+    def wait_until_scheduler_thread_ready(self, timeout_s: float) -> bool:
+        return self._thread_ready
 
     def start_torch_profiler(self, trace_path_template: str, run_id: str | None):
         self.profiler_calls.append(("start", trace_path_template, run_id))
-        return {"success": True}
+        return self._response()
 
     def stop_torch_profiler(self, run_id: str | None):
         self.profiler_calls.append(("stop", run_id))
-        return {"success": True}
+        return self._response()
+
+
+def _patch_direct_torch_profiler(
+    monkeypatch: pytest.MonkeyPatch, calls: list[tuple]
+) -> None:
+    """Record direct (non-delegated) TorchProfiler singleton access."""
+    monkeypatch.setattr(
+        runtime_mod.TorchProfiler,
+        "start",
+        classmethod(
+            lambda cls, template, run_id=None: calls.append(("start", template, run_id))
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_mod.TorchProfiler,
+        "stop",
+        classmethod(lambda cls, *, run_id=None: calls.append(("stop", run_id))),
+    )
+    monkeypatch.setattr(
+        runtime_mod.TorchProfiler, "is_active", classmethod(lambda cls: bool(calls))
+    )
+    monkeypatch.setattr(
+        runtime_mod.TorchProfiler, "get_active_run_id", classmethod(lambda cls: "run-1")
+    )
+
+
+def _profiler_stage(scheduler, *, name: str, owner: bool, process_has_owner: bool):
+    return Stage(
+        name=name,
+        role="single",
+        get_next=lambda request_id, output: None,
+        gpu_id=None,
+        endpoints={},
+        control_plane=RecordingStageControlPlane(),
+        relay=FakeRelay(),
+        scheduler=scheduler,
+        torch_profiler_owner=owner,
+        torch_profiler_process_has_owner=process_has_owner,
+    )
 
 
 def test_admin_messages_round_trip() -> None:
@@ -543,3 +595,484 @@ def test_stage_rejects_profiler_owner_without_control_capability() -> None:
             scheduler=FakeScheduler(),
             torch_profiler_owner=True,
         )
+
+
+def test_ownerless_process_still_profiles_directly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A process with no owner keeps the pre-existing direct path, so a partial
+    rollout never silently drops that process's Torch trace."""
+    monkeypatch.setenv("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD", "1")
+    direct_calls: list[tuple] = []
+    _patch_direct_torch_profiler(monkeypatch, direct_calls)
+
+    scheduler = ProfilerControlScheduler()
+    stage = _profiler_stage(
+        scheduler, name="vocoder", owner=False, process_has_owner=False
+    )
+
+    stage._on_profiler_start(
+        ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace")
+    )
+    stage._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
+
+    assert direct_calls == [
+        ("start", f"/tmp/vocoder/trace_pid{os.getpid()}", "run-1"),
+        ("stop", "run-1"),
+    ]
+    assert scheduler.profiler_calls == []
+
+
+def test_colocated_sibling_never_touches_the_profiler_singleton(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MOSS-TTS-Local runs ``preprocessing`` and the owning ``tts_engine`` in
+    one process. If the sibling handled the broadcast directly it would create
+    the singleton on the control thread and the owner's start would then no-op
+    on it -- a trace with CUDA activity but no CPU operators, the exact defect
+    this mode exists to fix."""
+    monkeypatch.setenv("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD", "1")
+    direct_calls: list[tuple] = []
+    _patch_direct_torch_profiler(monkeypatch, direct_calls)
+
+    scheduler = ProfilerControlScheduler()
+    sibling = _profiler_stage(
+        scheduler, name="preprocessing", owner=False, process_has_owner=True
+    )
+    owner = _profiler_stage(
+        scheduler, name="tts_engine", owner=True, process_has_owner=True
+    )
+
+    # The sibling is handed the broadcast first: worst-case ordering.
+    msg = ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace")
+    sibling._on_profiler_start(msg)
+    owner._on_profiler_start(msg)
+    sibling._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
+    owner._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
+
+    assert direct_calls == []
+    assert scheduler.profiler_calls == [
+        ("start", f"/tmp/tts_engine/trace_pid{os.getpid()}", "run-1"),
+        ("stop", "run-1"),
+    ]
+
+
+def test_owner_refuses_to_profile_before_the_scheduler_thread_is_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``Stage.start`` does not wait for the scheduler thread to publish its id,
+    so a start can arrive early. Falling back to a direct start would silently
+    profile on the wrong thread; refusing is the honest outcome."""
+    monkeypatch.setenv("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD", "1")
+    direct_calls: list[tuple] = []
+    _patch_direct_torch_profiler(monkeypatch, direct_calls)
+
+    scheduler = ProfilerControlScheduler(thread_ready=False)
+    owner = _profiler_stage(
+        scheduler, name="tts_engine", owner=True, process_has_owner=True
+    )
+
+    owner._on_profiler_start(
+        ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace")
+    )
+
+    assert direct_calls == []
+    assert scheduler.profiler_calls == []
+
+
+def test_profiler_control_failure_does_not_kill_the_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Profiler broadcasts are fire-and-forget PUSH with no response channel,
+    and an exception escaping a message handler tears down every stage in the
+    process. A failed profiler start must not cost the serving process."""
+    monkeypatch.setenv("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD", "1")
+    direct_calls: list[tuple] = []
+    _patch_direct_torch_profiler(monkeypatch, direct_calls)
+
+    scheduler = ProfilerControlScheduler(succeed=False)
+    owner = _profiler_stage(
+        scheduler, name="tts_engine", owner=True, process_has_owner=True
+    )
+
+    owner._on_profiler_start(
+        ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace")
+    )
+    owner._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
+
+    assert [name for name, *_ in scheduler.profiler_calls] == ["start", "stop"]
+    assert direct_calls == []
+
+
+def test_scheduler_thread_mode_off_keeps_legacy_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the env flag an owner stage behaves exactly as before the PR."""
+    monkeypatch.delenv("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD", raising=False)
+    direct_calls: list[tuple] = []
+    _patch_direct_torch_profiler(monkeypatch, direct_calls)
+
+    scheduler = ProfilerControlScheduler()
+    owner = _profiler_stage(
+        scheduler, name="tts_engine", owner=True, process_has_owner=True
+    )
+
+    owner._on_profiler_start(
+        ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace")
+    )
+    owner._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
+
+    assert direct_calls == [
+        ("start", f"/tmp/tts_engine/trace_pid{os.getpid()}", "run-1"),
+        ("stop", "run-1"),
+    ]
+    assert scheduler.profiler_calls == []
+
+
+def test_enable_torch_false_never_starts_the_profiler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The event recorder still runs, but no Torch profiler is touched."""
+    monkeypatch.setenv("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD", "1")
+    direct_calls: list[tuple] = []
+    _patch_direct_torch_profiler(monkeypatch, direct_calls)
+
+    scheduler = ProfilerControlScheduler()
+    owner = _profiler_stage(
+        scheduler, name="tts_engine", owner=True, process_has_owner=True
+    )
+
+    owner._on_profiler_start(
+        ProfilerStartMessage(
+            run_id="run-1",
+            trace_path_template="/tmp/{stage}/trace",
+            enable_torch=False,
+        )
+    )
+
+    assert direct_calls == []
+    assert scheduler.profiler_calls == []
+
+
+def test_scheduler_admin_runs_torch_profiler_on_the_scheduler_thread() -> None:
+    """The point of the fix: Kineto CPU callbacks are thread-local, so
+    TorchProfiler.start/stop must execute on the model-execution thread, not
+    on the caller's control-plane thread."""
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+    scheduler._admin_queue = queue.Queue()
+    scheduler._scheduler_thread_id = None
+    scheduler._running = True
+
+    executed_on: list[tuple[str, int]] = []
+
+    class _RecordingTorchProfiler:
+        @staticmethod
+        def start(template: str, run_id: str | None = None) -> str:
+            executed_on.append(("start", threading.get_ident()))
+            return f"{template}_rank0.trace.json.gz"
+
+        @staticmethod
+        def stop(*, run_id: str | None = None) -> dict:
+            executed_on.append(("stop", threading.get_ident()))
+            return {"trace": "t", "table": None}
+
+    stop_event = threading.Event()
+    ready = threading.Event()
+
+    def _scheduler_loop() -> None:
+        scheduler._scheduler_thread_id = threading.get_ident()
+        ready.set()
+        while not stop_event.is_set():
+            scheduler._process_admin_requests()
+            time.sleep(0.001)
+
+    thread = threading.Thread(target=_scheduler_loop, daemon=True)
+    thread.start()
+    ready.wait(timeout=5.0)
+
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "sglang_omni.profiler.torch_profiler": SimpleNamespace(
+                TorchProfiler=_RecordingTorchProfiler
+            )
+        },
+    ):
+        try:
+            start_response = scheduler.start_torch_profiler("/tmp/trace", "run-1")
+            stop_response = scheduler.stop_torch_profiler("run-1")
+        finally:
+            stop_event.set()
+            thread.join(timeout=5.0)
+
+    assert start_response["success"] is True
+    assert stop_response["success"] is True
+
+    caller_thread_id = threading.get_ident()
+    assert [name for name, _ in executed_on] == ["start", "stop"]
+    for name, thread_id in executed_on:
+        assert thread_id == scheduler._scheduler_thread_id, name
+        assert thread_id != caller_thread_id, name
+
+
+def test_scheduler_admin_profiler_failure_surfaces_to_the_caller() -> None:
+    """Exceptions raised on the scheduler thread come back as admin errors so
+    Stage can turn them into a RuntimeError instead of hanging."""
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+    scheduler._admin_queue = queue.Queue()
+    scheduler._scheduler_thread_id = None
+    scheduler._running = True
+
+    class _ExplodingTorchProfiler:
+        @staticmethod
+        def start(template: str, run_id: str | None = None) -> str:
+            raise RuntimeError("kineto unavailable")
+
+    stop_event = threading.Event()
+    ready = threading.Event()
+
+    def _scheduler_loop() -> None:
+        scheduler._scheduler_thread_id = threading.get_ident()
+        ready.set()
+        while not stop_event.is_set():
+            scheduler._process_admin_requests()
+            time.sleep(0.001)
+
+    thread = threading.Thread(target=_scheduler_loop, daemon=True)
+    thread.start()
+    ready.wait(timeout=5.0)
+
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "sglang_omni.profiler.torch_profiler": SimpleNamespace(
+                TorchProfiler=_ExplodingTorchProfiler
+            )
+        },
+    ):
+        try:
+            response = scheduler.start_torch_profiler("/tmp/trace", "run-1")
+        finally:
+            stop_event.set()
+            thread.join(timeout=5.0)
+
+    assert response["success"] is False
+    assert "kineto unavailable" in response["error"]
+
+
+def test_scheduler_thread_readiness_reports_when_admin_would_run_inline() -> None:
+    """``_should_enqueue_admin`` silently runs inline until the scheduler thread
+    publishes its id. The profiler owner needs to distinguish those states."""
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+    scheduler._admin_queue = queue.Queue()
+    scheduler._scheduler_thread_id = None
+    scheduler._running = False
+
+    assert scheduler.wait_until_scheduler_thread_ready(0.05) is False
+
+    scheduler._running = True
+    assert scheduler.wait_until_scheduler_thread_ready(0.05) is False
+
+    def _publish() -> None:
+        time.sleep(0.02)
+        scheduler._scheduler_thread_id = threading.get_ident()
+
+    thread = threading.Thread(target=_publish, daemon=True)
+    thread.start()
+    try:
+        assert scheduler.wait_until_scheduler_thread_ready(5.0) is True
+    finally:
+        thread.join(timeout=5.0)
+
+
+def test_owner_refuses_to_stop_after_the_scheduler_thread_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stopping inline on the control thread is the same wrong-thread defect as
+    starting there, so a shutting-down scheduler must not be worked around."""
+    monkeypatch.setenv("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD", "1")
+    direct_calls: list[tuple] = []
+    _patch_direct_torch_profiler(monkeypatch, direct_calls)
+
+    scheduler = ProfilerControlScheduler(thread_ready=False)
+    owner = _profiler_stage(
+        scheduler, name="tts_engine", owner=True, process_has_owner=True
+    )
+
+    owner._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
+
+    assert direct_calls == []
+    assert scheduler.profiler_calls == []
+
+
+def test_profiler_admin_never_runs_inline_after_the_loop_exits() -> None:
+    """``OmniScheduler.start`` clears ``_scheduler_thread_id`` in its ``finally``
+    but leaves ``_running`` set until ``stop`` runs, so an exited scheduler loop
+    leaves a durable window where ``_should_enqueue_admin`` reports inline. A
+    readiness check on the Stage side cannot close it -- the loop can exit
+    between that check and the handoff -- so the profiler path must re-check and
+    fail rather than run TorchProfiler on the caller's thread."""
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+    scheduler._admin_queue = queue.Queue()
+    # Exactly the post-loop state: id cleared, _running not yet cleared.
+    scheduler._running = True
+    scheduler._scheduler_thread_id = None
+
+    executed_on: list[int] = []
+
+    class _RecordingTorchProfiler:
+        @staticmethod
+        def start(template: str, run_id: str | None = None) -> str:
+            executed_on.append(threading.get_ident())
+            return "trace"
+
+        @staticmethod
+        def stop(*, run_id: str | None = None) -> dict:
+            executed_on.append(threading.get_ident())
+            return {}
+
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "sglang_omni.profiler.torch_profiler": SimpleNamespace(
+                TorchProfiler=_RecordingTorchProfiler
+            )
+        },
+    ):
+        start_response = scheduler.start_torch_profiler("/tmp/trace", "run-1")
+        stop_response = scheduler.stop_torch_profiler("run-1")
+
+    assert start_response["success"] is False
+    assert stop_response["success"] is False
+    # The whole point: nothing ran on this thread.
+    assert executed_on == []
+    assert scheduler._admin_queue.empty()
+
+
+def test_profiler_admin_runs_inline_when_already_on_the_scheduler_thread() -> None:
+    """Being the scheduler thread is the goal state, not a fallback."""
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+    scheduler._admin_queue = queue.Queue()
+    scheduler._running = True
+    scheduler._scheduler_thread_id = threading.get_ident()
+
+    executed_on: list[int] = []
+
+    class _RecordingTorchProfiler:
+        @staticmethod
+        def start(template: str, run_id: str | None = None) -> str:
+            executed_on.append(threading.get_ident())
+            return "trace"
+
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "sglang_omni.profiler.torch_profiler": SimpleNamespace(
+                TorchProfiler=_RecordingTorchProfiler
+            )
+        },
+    ):
+        response = scheduler.start_torch_profiler("/tmp/trace", "run-1")
+
+    assert response["success"] is True
+    assert executed_on == [threading.get_ident()]
+
+
+def test_expired_profiler_start_is_dropped_when_drained_late() -> None:
+    """``_enqueue_admin`` reports a timeout but leaves the request queued. A
+    scheduler that was busy past the deadline must drop it: the caller was told
+    the start failed and will never issue a stop, so running it late leaves an
+    orphan profiler taxing the serving path."""
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+    scheduler._admin_queue = queue.Queue()
+    scheduler._running = True
+    # A live scheduler thread that is too busy to drain: forces the enqueue path.
+    scheduler._scheduler_thread_id = threading.get_ident() + 1
+
+    started: list[str] = []
+
+    class _RecordingTorchProfiler:
+        @staticmethod
+        def start(template: str, run_id: str | None = None) -> str:
+            started.append(template)
+            return "trace"
+
+    with mock.patch.object(
+        OmniScheduler, "_enqueue_admin", autospec=True
+    ) as enqueue_admin:
+
+        def _queue_and_time_out(self, action, payload):
+            # Mirror the real body, minus the blocking wait the caller gave up on.
+            queued = dict(payload)
+            queued.pop("_admin_timeout_s", None)
+            self._admin_queue.put((action, queued, queue.Queue(maxsize=1)))
+            return {"success": False, "error": "admin operation timed out"}
+
+        enqueue_admin.side_effect = _queue_and_time_out
+        response = scheduler.start_torch_profiler("/tmp/trace", "run-1")
+
+    assert response["success"] is False
+    assert scheduler._admin_queue.qsize() == 1
+
+    # The scheduler frees up after the deadline and drains what it missed.
+    action, payload, _ = scheduler._admin_queue.get_nowait()
+    payload["_deadline"] = time.monotonic() - 1.0
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "sglang_omni.profiler.torch_profiler": SimpleNamespace(
+                TorchProfiler=_RecordingTorchProfiler
+            )
+        },
+    ):
+        late = scheduler._run_admin_action(action, payload)
+
+    assert late["success"] is False
+    assert "expired" in late["error"]
+    assert started == []
+
+
+def test_live_profiler_request_carries_a_deadline_but_still_runs() -> None:
+    """The deadline must not reject requests that arrive in time."""
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+    started: list[str] = []
+
+    class _RecordingTorchProfiler:
+        @staticmethod
+        def start(template: str, run_id: str | None = None) -> str:
+            started.append(template)
+            return "trace"
+
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "sglang_omni.profiler.torch_profiler": SimpleNamespace(
+                TorchProfiler=_RecordingTorchProfiler
+            )
+        },
+    ):
+        response = scheduler._run_admin_action(
+            "torch_profiler_start",
+            {
+                "trace_path_template": "/tmp/trace",
+                "run_id": "run-1",
+                "_deadline": time.monotonic() + 30.0,
+            },
+        )
+
+    assert response["success"] is True
+    assert started == ["/tmp/trace"]

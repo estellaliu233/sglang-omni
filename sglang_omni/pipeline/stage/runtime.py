@@ -53,6 +53,14 @@ logger = logging.getLogger(__name__)
 GetNextFn = Callable[[str, Any], str | list[str] | None]
 GetStreamDoneTargetsFn = Callable[[str, Any], str | list[str] | None]
 _SCHEDULER_THREAD_PROFILER_ENV = "SGLANG_TORCH_PROFILER_SCHEDULER_THREAD"
+# The scheduler thread publishes its identity as its first act, so readiness is
+# a startup-order guard, not a wait for the model to load.
+_SCHEDULER_THREAD_READY_TIMEOUT_S = 30.0
+
+# How a stage may touch the process-wide TorchProfiler singleton.
+_TORCH_PROFILER_DIRECT = "direct"
+_TORCH_PROFILER_SCHEDULER_OWNER = "scheduler_owner"
+_TORCH_PROFILER_SCHEDULER_SIBLING = "scheduler_sibling"
 
 
 @runtime_checkable
@@ -64,6 +72,8 @@ class SchedulerThreadProfilerControl(Protocol):
     ) -> dict[str, Any]: ...
 
     def stop_torch_profiler(self, run_id: str | None) -> dict[str, Any]: ...
+
+    def wait_until_scheduler_thread_ready(self, timeout_s: float) -> bool: ...
 
 
 def _error_text(exc: BaseException) -> str:
@@ -113,6 +123,7 @@ class Stage:
         tp_fanout: TPLeaderFanout | None = None,
         is_terminal: bool = False,
         torch_profiler_owner: bool = False,
+        torch_profiler_process_has_owner: bool = False,
     ):
         self.name = name
         self.role = role
@@ -132,6 +143,9 @@ class Stage:
         self._tp_fanout = tp_fanout
         self._is_terminal = is_terminal
         self._torch_profiler_owner = torch_profiler_owner
+        self._torch_profiler_process_has_owner = (
+            torch_profiler_process_has_owner or torch_profiler_owner
+        )
         self._owns_external_io = role in {"single", "leader"}
 
         if self._torch_profiler_owner and not isinstance(
@@ -1580,34 +1594,66 @@ class Stage:
         self._clear_request_state(request_id)
         self.scheduler.abort(request_id)
 
+    def _torch_profiler_mode(self) -> str:
+        """How this stage may touch the process-wide TorchProfiler singleton.
+
+        Kineto CPU operator callbacks are thread-local. The AR scheduler runs in
+        a dedicated thread that predates any control message, so starting the
+        profiler on the asyncio thread records CUDA activities but no CPU-side
+        Aten operators. The opt-in mode routes the lifecycle through the
+        scheduler admin queue instead.
+
+        The singleton is per process and a process can host several stages on
+        one asyncio loop, so the decision is per process, not per stage:
+
+        - ``scheduler_owner``: drives the singleton from its scheduler thread.
+        - ``scheduler_sibling``: colocated with an owner, so it must not touch
+          the singleton at all -- otherwise whichever stage handles the
+          broadcast first wins and the profiler runs on the wrong thread.
+        - ``direct``: mode off, or no owner in this process. Keeps the
+          pre-existing behavior so an ownerless process never loses its trace.
+        """
+
+        if os.environ.get(_SCHEDULER_THREAD_PROFILER_ENV) != "1":
+            return _TORCH_PROFILER_DIRECT
+        if self._torch_profiler_owner:
+            return _TORCH_PROFILER_SCHEDULER_OWNER
+        if self._torch_profiler_process_has_owner:
+            return _TORCH_PROFILER_SCHEDULER_SIBLING
+        return _TORCH_PROFILER_DIRECT
+
+    def _profiler_control_failed(self, operation: str, detail: object) -> None:
+        """Report a profiler control failure without killing the stage.
+
+        ``ProfilerControlClient`` broadcasts start/stop as fire-and-forget PUSH
+        messages with no response channel, and an exception escaping a message
+        handler tears down every stage in this process. A missing trace must not
+        cost the serving process, so failures are logged instead of raised.
+        """
+
+        logger.error(
+            "Stage %s Torch profiler %s failed: %s", self.name, operation, detail
+        )
+
     def _on_profiler_start(self, msg: ProfilerStartMessage) -> None:
         run_id = msg.run_id
-        scheduler_thread_torch = os.environ.get(_SCHEDULER_THREAD_PROFILER_ENV) == "1"
-        if msg.enable_torch and scheduler_thread_torch:
+        mode = self._torch_profiler_mode()
+        route_to_scheduler = mode == _TORCH_PROFILER_SCHEDULER_OWNER
+        skip_torch = mode == _TORCH_PROFILER_SCHEDULER_SIBLING
+        if (
+            msg.enable_torch
+            and not skip_torch
+            and (route_to_scheduler or not TorchProfiler.is_active())
+        ):
             base_tpl = msg.trace_path_template.format(run_id=run_id, stage=self.name)
             template = f"{base_tpl}_pid{os.getpid()}"
             prof_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
             if prof_dir and not os.path.isabs(template):
                 template = os.path.join(prof_dir, template)
-            # Kineto CPU operator callbacks are thread-local. The AR scheduler
-            # runs in a dedicated thread that predates this control message, so
-            # starting here on the asyncio thread records CUDA activities but
-            # no CPU-side Aten operators. Route the opt-in profiler lifecycle
-            # through OmniScheduler's admin queue so start/stop execute on the
-            # actual compute thread. Ownership is explicit runtime intent,
-            # independent of a model-specific stage name. Sibling stages still
-            # participate in the event recorder below.
-            if self._torch_profiler_owner:
-                response = self.scheduler.start_torch_profiler(template, run_id)
-                if not response.get("success", False):
-                    raise RuntimeError(response.get("error", response.get("message")))
-        elif msg.enable_torch and not TorchProfiler.is_active():
-            base_tpl = msg.trace_path_template.format(run_id=run_id, stage=self.name)
-            template = f"{base_tpl}_pid{os.getpid()}"
-            prof_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
-            if prof_dir and not os.path.isabs(template):
-                template = os.path.join(prof_dir, template)
-            TorchProfiler.start(template, run_id=run_id)
+            if route_to_scheduler:
+                self._start_torch_profiler_on_scheduler(template, run_id)
+            else:
+                TorchProfiler.start(template, run_id=run_id)
         if msg.event_dir is not None:
             try:
                 _get_recorder().start(
@@ -1620,14 +1666,68 @@ class Stage:
                     exc_info=True,
                 )
 
+    def _scheduler_thread_ready_for_profiler(
+        self, operation: str, timeout_s: float
+    ) -> bool:
+        """Whether delegation would actually land on the scheduler thread.
+
+        ``_should_enqueue_admin`` runs an action inline whenever the scheduler
+        thread has not published its id yet, or has already exited. That is fine
+        for ordinary admin work and wrong here, so the caller must skip rather
+        than fall back: a direct call would produce a trace that looks complete
+        but has no CPU operators, which is the defect this mode exists to fix.
+        """
+
+        if self.scheduler.wait_until_scheduler_thread_ready(timeout_s):
+            return True
+        self._profiler_control_failed(
+            operation,
+            "scheduler thread is not ready, refusing to run on the control thread",
+        )
+        return False
+
+    def _start_torch_profiler_on_scheduler(
+        self, template: str, run_id: str | None
+    ) -> None:
+        """Delegate the start to the scheduler thread, or give up loudly."""
+
+        # Stage.start does not wait for the scheduler thread, so an early start
+        # is a legitimate startup race worth waiting out.
+        if not self._scheduler_thread_ready_for_profiler(
+            "start", _SCHEDULER_THREAD_READY_TIMEOUT_S
+        ):
+            return
+        # TorchProfiler.start is idempotent per run_id, so re-issuing a start
+        # for the active run is a no-op rather than an error.
+        response = self.scheduler.start_torch_profiler(template, run_id)
+        if not response.get("success", False):
+            self._profiler_control_failed(
+                "start", response.get("error", response.get("message"))
+            )
+
+    def _stop_torch_profiler_on_scheduler(self, run_id: str | None) -> None:
+        """Delegate the stop to the same thread that started the profiler."""
+
+        # No wait here: by stop time the thread has long been up, so "not ready"
+        # means it is shutting down. Blocking the control thread on a scheduler
+        # that is going away would stall the stage for no benefit.
+        if not self._scheduler_thread_ready_for_profiler("stop", 0.0):
+            return
+        response = self.scheduler.stop_torch_profiler(run_id)
+        if not response.get("success", False):
+            self._profiler_control_failed(
+                "stop", response.get("error", response.get("message"))
+            )
+
     def _on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
         # run_id=None is a wildcard (stop whatever's active).
-        scheduler_thread_torch = os.environ.get(_SCHEDULER_THREAD_PROFILER_ENV) == "1"
-        if scheduler_thread_torch:
-            if self._torch_profiler_owner:
-                response = self.scheduler.stop_torch_profiler(msg.run_id)
-                if not response.get("success", False):
-                    raise RuntimeError(response.get("error", response.get("message")))
+        # Mirrors _on_profiler_start: only the process-local owner drives the
+        # singleton, siblings stay out, ownerless processes stop their own.
+        mode = self._torch_profiler_mode()
+        if mode == _TORCH_PROFILER_SCHEDULER_SIBLING:
+            pass
+        elif mode == _TORCH_PROFILER_SCHEDULER_OWNER:
+            self._stop_torch_profiler_on_scheduler(msg.run_id)
         elif TorchProfiler.is_active() and (
             msg.run_id is None or TorchProfiler.get_active_run_id() == msg.run_id
         ):
