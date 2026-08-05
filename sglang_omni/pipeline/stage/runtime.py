@@ -56,6 +56,9 @@ SCHEDULER_THREAD_PROFILER_ENV = "SGLANG_TORCH_PROFILER_SCHEDULER_THREAD"
 # The scheduler thread publishes its identity as its first act, so readiness is
 # a startup-order guard, not a wait for the model to load.
 _SCHEDULER_THREAD_READY_TIMEOUT_S = 30.0
+# Matches the profiler admin timeout: a stop already handed to the scheduler
+# either exports its trace or fails on its own deadline within this window.
+_PROFILER_SHUTDOWN_DRAIN_TIMEOUT_S = 30.0
 
 # How a stage may touch the process-wide TorchProfiler singleton.
 _TORCH_PROFILER_DIRECT = "direct"
@@ -184,6 +187,11 @@ class Stage:
         self._receive_lane_tails: dict[tuple[str, str], asyncio.Future[None]] = {}
         self._profiler_op_queue: asyncio.Queue[Callable[[], None]] | None = None
         self._profiler_op_worker: asyncio.Task | None = None
+        # Two signals, because they fire at different points: the first stops
+        # new work being queued, the second tells work already running in the
+        # executor to bail before it touches a scheduler that is going away.
+        self._profiler_shutdown = threading.Event()
+        self._profiler_lane_abandoned = threading.Event()
         self._scheduler_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._scheduler_crash_error: BaseException | None = None
@@ -255,12 +263,7 @@ class Stage:
         await asyncio.gather(*receive_tasks, return_exceptions=True)
         self._receive_tasks.clear()
         self._receive_lane_tails.clear()
-        profiler_worker = self._profiler_op_worker
-        if profiler_worker is not None:
-            profiler_worker.cancel()
-            with suppress(asyncio.CancelledError):
-                await profiler_worker
-            self._profiler_op_worker = None
+        await self._shutdown_profiler_ops()
         if self.scheduler is not None:
             try:
                 self.scheduler.stop()
@@ -1643,6 +1646,38 @@ class Stage:
             "Stage %s Torch profiler %s failed: %s", self.name, operation, detail
         )
 
+    async def _shutdown_profiler_ops(self) -> None:
+        """Let queued profiler work finish, within a bound, then stop the lane.
+
+        A ``/stop_profile`` immediately followed by shutdown is an ordinary
+        operator sequence, and the queued stop is what exports the trace, so
+        cancelling outright would throw it away. The drain is bounded because
+        shutdown must not hang on a scheduler that is already gone.
+
+        Cancelling the worker cannot interrupt a call already running in the
+        executor -- ``Task.cancel`` does not reach into the thread. So the
+        deadline also marks the lane abandoned, and a call that was blocked in
+        its readiness wait checks that before going near the scheduler.
+        """
+
+        self._profiler_shutdown.set()
+        worker = self._profiler_op_worker
+        if worker is None:
+            return
+        try:
+            await asyncio.wait_for(
+                self._wait_for_profiler_ops(), _PROFILER_SHUTDOWN_DRAIN_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Stage %s stopped with profiler operations still pending", self.name
+            )
+        self._profiler_lane_abandoned.set()
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
+        self._profiler_op_worker = None
+
     def _submit_profiler_op(self, call: Callable[[], None]) -> None:
         """Hand a blocking profiler operation to the serialized worker.
 
@@ -1655,6 +1690,11 @@ class Stage:
         can never overtake the start it belongs to.
         """
 
+        if self._profiler_shutdown.is_set():
+            logger.warning(
+                "Stage %s is shutting down, dropping profiler operation", self.name
+            )
+            return
         if self._profiler_op_queue is None:
             self._profiler_op_queue = asyncio.Queue()
         if self._profiler_op_worker is None or self._profiler_op_worker.done():
@@ -1732,7 +1772,15 @@ class Stage:
         but has no CPU operators, which is the defect this mode exists to fix.
         """
 
-        if self.scheduler.wait_until_scheduler_thread_ready(timeout_s):
+        ready = self.scheduler.wait_until_scheduler_thread_ready(timeout_s)
+        if self._profiler_lane_abandoned.is_set():
+            # The stage stopped waiting for this call and is tearing the
+            # scheduler down. Anything issued now races that teardown.
+            self._profiler_control_failed(
+                operation, "stage shut down before the scheduler thread answered"
+            )
+            return False
+        if ready:
             return True
         self._profiler_control_failed(
             operation,

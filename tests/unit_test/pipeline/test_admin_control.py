@@ -8,7 +8,6 @@ import queue
 import sys
 import threading
 import time
-from contextlib import suppress
 from types import SimpleNamespace
 from unittest import mock
 
@@ -102,14 +101,10 @@ async def _release_profiler_lane(stage: Stage) -> None:
     worker are bound to the loop that created them. Production keeps one loop
     for the stage's whole life; tests have to reset between calls.
     """
-    await stage._wait_for_profiler_ops()
-    worker = stage._profiler_op_worker
-    if worker is not None:
-        worker.cancel()
-        with suppress(asyncio.CancelledError):
-            await worker
-    stage._profiler_op_worker = None
+    await stage._shutdown_profiler_ops()
     stage._profiler_op_queue = None
+    stage._profiler_shutdown.clear()
+    stage._profiler_lane_abandoned.clear()
 
 
 def _profile_start(stage: Stage, msg: ProfilerStartMessage) -> None:
@@ -1153,7 +1148,7 @@ def test_live_profiler_request_carries_a_deadline_but_still_runs() -> None:
     assert started == ["/tmp/trace"]
 
 
-def test_profiler_delegation_does_not_stall_submits_and_acks(
+def test_profiler_delegation_does_not_stall_control_message_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The readiness wait and the admin handoff each block for up to 30s. If a
@@ -1195,7 +1190,7 @@ def test_profiler_delegation_does_not_stall_submits_and_acks(
             )
             handled.append(f"ack-{index}")
 
-        # Submits and acks got through while the delegation was still blocked.
+        # Dispatch kept flowing while the delegation was still blocked.
         assert owner.scheduler.profiler_calls == []
         release.set()
         await asyncio.wait_for(owner._wait_for_profiler_ops(), timeout=5.0)
@@ -1239,3 +1234,79 @@ def test_profiler_operations_run_in_arrival_order(
     asyncio.run(_run())
 
     assert [name for name, *_ in owner.scheduler.profiler_calls] == ["start", "stop"]
+
+
+def test_shutdown_drains_a_queued_profiler_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`/stop_profile` immediately followed by shutdown is an ordinary operator
+    sequence. The queued stop is what exports the trace, so shutdown has to let
+    it run instead of cancelling it away."""
+    monkeypatch.setenv("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD", "1")
+    direct_calls: list[tuple] = []
+    _patch_direct_torch_profiler(monkeypatch, direct_calls)
+
+    scheduler = ProfilerControlScheduler()
+    owner = _profiler_stage(
+        scheduler, name="tts_engine", owner=True, process_has_owner=True
+    )
+
+    async def _run() -> None:
+        owner._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
+        # No drain here: shutdown lands while the stop is still queued.
+        await owner.stop()
+
+    asyncio.run(_run())
+
+    assert scheduler.profiler_calls == [("stop", "run-1")]
+
+
+def test_shutdown_is_bounded_when_a_profiler_operation_is_stuck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown must not hang on a scheduler that is already gone, and must not
+    accept new profiler work once it has begun."""
+    monkeypatch.setenv("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD", "1")
+    monkeypatch.setattr(runtime_mod, "_PROFILER_SHUTDOWN_DRAIN_TIMEOUT_S", 0.05)
+    direct_calls: list[tuple] = []
+    _patch_direct_torch_profiler(monkeypatch, direct_calls)
+
+    release = threading.Event()
+
+    class _StuckScheduler(ProfilerControlScheduler):
+        def wait_until_scheduler_thread_ready(self, timeout_s: float) -> bool:
+            release.wait(timeout=5.0)
+            return True
+
+    scheduler = _StuckScheduler()
+    owner = _profiler_stage(
+        scheduler, name="tts_engine", owner=True, process_has_owner=True
+    )
+
+    async def _run() -> float:
+        owner._on_profiler_start(
+            ProfilerStartMessage(
+                run_id="run-1", trace_path_template="/tmp/{stage}/trace"
+            )
+        )
+        await asyncio.sleep(0)  # let the worker reach the stuck call
+        started = time.monotonic()
+        await owner.stop()
+        elapsed = time.monotonic() - started
+
+        # Shutdown has begun: further profiler work is refused outright.
+        owner._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
+        assert owner._profiler_op_queue is not None
+        assert owner._profiler_op_queue.empty()
+        return elapsed
+
+    try:
+        elapsed = asyncio.run(_run())
+    finally:
+        release.set()
+
+    assert elapsed < 2.0
+    assert direct_calls == []
+    # The executor call outlived shutdown -- Task.cancel cannot reach it -- but
+    # it found the lane abandoned and never reached the scheduler.
+    assert [name for name, *_ in scheduler.profiler_calls] == []
