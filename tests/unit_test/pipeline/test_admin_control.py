@@ -93,6 +93,16 @@ def _patch_direct_torch_profiler(
     )
 
 
+def _profile_start(stage: Stage, msg: ProfilerStartMessage) -> None:
+    """Drive the async profiler-start handler from a sync test."""
+    asyncio.run(stage._on_profiler_start(msg))
+
+
+def _profile_stop(stage: Stage, msg: ProfilerStopMessage) -> None:
+    """Drive the async profiler-stop handler from a sync test."""
+    asyncio.run(stage._on_profiler_stop(msg))
+
+
 def _profiler_stage(scheduler, *, name: str, owner: bool, process_has_owner: bool):
     return Stage(
         name=name,
@@ -564,13 +574,14 @@ def test_stage_routes_torch_profiler_to_explicit_owner(
         torch_profiler_owner=True,
     )
 
-    stage._on_profiler_start(
+    _profile_start(
+        stage,
         ProfilerStartMessage(
             run_id="run-1",
             trace_path_template="/tmp/{run_id}/{stage}/trace",
-        )
+        ),
     )
-    stage._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
+    _profile_stop(stage, ProfilerStopMessage(run_id="run-1"))
 
     assert scheduler.profiler_calls == [
         (
@@ -611,10 +622,11 @@ def test_ownerless_process_still_profiles_directly(
         scheduler, name="vocoder", owner=False, process_has_owner=False
     )
 
-    stage._on_profiler_start(
-        ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace")
+    _profile_start(
+        stage,
+        ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace"),
     )
-    stage._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
+    _profile_stop(stage, ProfilerStopMessage(run_id="run-1"))
 
     assert direct_calls == [
         ("start", f"/tmp/vocoder/trace_pid{os.getpid()}", "run-1"),
@@ -637,11 +649,13 @@ def test_ownerless_process_forwards_a_new_run_to_the_profiler(
         scheduler, name="vocoder", owner=False, process_has_owner=False
     )
 
-    stage._on_profiler_start(
-        ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace")
+    _profile_start(
+        stage,
+        ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace"),
     )
-    stage._on_profiler_start(
-        ProfilerStartMessage(run_id="run-2", trace_path_template="/tmp/{stage}/trace")
+    _profile_start(
+        stage,
+        ProfilerStartMessage(run_id="run-2", trace_path_template="/tmp/{stage}/trace"),
     )
 
     assert direct_calls == [
@@ -673,10 +687,10 @@ def test_colocated_sibling_never_touches_the_profiler_singleton(
 
     # The sibling is handed the broadcast first: worst-case ordering.
     msg = ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace")
-    sibling._on_profiler_start(msg)
-    owner._on_profiler_start(msg)
-    sibling._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
-    owner._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
+    _profile_start(sibling, msg)
+    _profile_start(owner, msg)
+    _profile_stop(sibling, ProfilerStopMessage(run_id="run-1"))
+    _profile_stop(owner, ProfilerStopMessage(run_id="run-1"))
 
     assert direct_calls == []
     assert scheduler.profiler_calls == [
@@ -700,8 +714,9 @@ def test_owner_refuses_to_profile_before_the_scheduler_thread_is_ready(
         scheduler, name="tts_engine", owner=True, process_has_owner=True
     )
 
-    owner._on_profiler_start(
-        ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace")
+    _profile_start(
+        owner,
+        ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace"),
     )
 
     assert direct_calls == []
@@ -723,10 +738,11 @@ def test_profiler_control_failure_does_not_kill_the_stage(
         scheduler, name="tts_engine", owner=True, process_has_owner=True
     )
 
-    owner._on_profiler_start(
-        ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace")
+    _profile_start(
+        owner,
+        ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace"),
     )
-    owner._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
+    _profile_stop(owner, ProfilerStopMessage(run_id="run-1"))
 
     assert [name for name, *_ in scheduler.profiler_calls] == ["start", "stop"]
     assert direct_calls == []
@@ -745,10 +761,11 @@ def test_scheduler_thread_mode_off_keeps_legacy_behavior(
         scheduler, name="tts_engine", owner=True, process_has_owner=True
     )
 
-    owner._on_profiler_start(
-        ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace")
+    _profile_start(
+        owner,
+        ProfilerStartMessage(run_id="run-1", trace_path_template="/tmp/{stage}/trace"),
     )
-    owner._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
+    _profile_stop(owner, ProfilerStopMessage(run_id="run-1"))
 
     assert direct_calls == [
         ("start", f"/tmp/tts_engine/trace_pid{os.getpid()}", "run-1"),
@@ -770,12 +787,13 @@ def test_enable_torch_false_never_starts_the_profiler(
         scheduler, name="tts_engine", owner=True, process_has_owner=True
     )
 
-    owner._on_profiler_start(
+    _profile_start(
+        owner,
         ProfilerStartMessage(
             run_id="run-1",
             trace_path_template="/tmp/{stage}/trace",
             enable_torch=False,
-        )
+        ),
     )
 
     assert direct_calls == []
@@ -933,7 +951,7 @@ def test_owner_refuses_to_stop_after_the_scheduler_thread_is_gone(
         scheduler, name="tts_engine", owner=True, process_has_owner=True
     )
 
-    owner._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
+    _profile_stop(owner, ProfilerStopMessage(run_id="run-1"))
 
     assert direct_calls == []
     assert scheduler.profiler_calls == []
@@ -1104,3 +1122,49 @@ def test_live_profiler_request_carries_a_deadline_but_still_runs() -> None:
 
     assert response["success"] is True
     assert started == ["/tmp/trace"]
+
+
+def test_profiler_delegation_does_not_block_the_stage_control_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The readiness wait and the admin handoff each block for up to 30s. They
+    run on the loop that also serves submits and acks, so they must go to an
+    executor rather than stalling message handling."""
+    monkeypatch.setenv("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD", "1")
+    direct_calls: list[tuple] = []
+    _patch_direct_torch_profiler(monkeypatch, direct_calls)
+
+    release = threading.Event()
+
+    class _BlockingScheduler(ProfilerControlScheduler):
+        def wait_until_scheduler_thread_ready(self, timeout_s: float) -> bool:
+            release.wait(timeout=5.0)
+            return True
+
+    owner = _profiler_stage(
+        _BlockingScheduler(), name="tts_engine", owner=True, process_has_owner=True
+    )
+
+    async def _run() -> None:
+        profiler = asyncio.ensure_future(
+            owner._on_profiler_start(
+                ProfilerStartMessage(
+                    run_id="run-1", trace_path_template="/tmp/{stage}/trace"
+                )
+            )
+        )
+        # The loop must keep turning while the delegation blocks in its thread.
+        served = 0
+        for _ in range(5):
+            await asyncio.sleep(0)
+            served += 1
+        assert not profiler.done()
+        assert served == 5
+
+        release.set()
+        await asyncio.wait_for(profiler, timeout=5.0)
+
+    asyncio.run(_run())
+    assert owner.scheduler.profiler_calls == [
+        ("start", f"/tmp/tts_engine/trace_pid{os.getpid()}", "run-1")
+    ]

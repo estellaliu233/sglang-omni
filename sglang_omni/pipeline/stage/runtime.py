@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 GetNextFn = Callable[[str, Any], str | list[str] | None]
 GetStreamDoneTargetsFn = Callable[[str, Any], str | list[str] | None]
-_SCHEDULER_THREAD_PROFILER_ENV = "SGLANG_TORCH_PROFILER_SCHEDULER_THREAD"
+SCHEDULER_THREAD_PROFILER_ENV = "SGLANG_TORCH_PROFILER_SCHEDULER_THREAD"
 # The scheduler thread publishes its identity as its first act, so readiness is
 # a startup-order guard, not a wait for the model to load.
 _SCHEDULER_THREAD_READY_TIMEOUT_S = 30.0
@@ -338,9 +338,9 @@ class Stage:
         elif isinstance(msg, DataReadyMessage):
             self._schedule_receive_task(msg)
         elif isinstance(msg, ProfilerStartMessage):
-            self._on_profiler_start(msg)
+            await self._on_profiler_start(msg)
         elif isinstance(msg, ProfilerStopMessage):
-            self._on_profiler_stop(msg)
+            await self._on_profiler_stop(msg)
         elif isinstance(msg, AdminMessage):
             await self._on_admin(msg)
 
@@ -1614,7 +1614,7 @@ class Stage:
           pre-existing behavior so an ownerless process never loses its trace.
         """
 
-        if os.environ.get(_SCHEDULER_THREAD_PROFILER_ENV) != "1":
+        if os.environ.get(SCHEDULER_THREAD_PROFILER_ENV) != "1":
             return _TORCH_PROFILER_DIRECT
         if self._torch_profiler_owner:
             return _TORCH_PROFILER_SCHEDULER_OWNER
@@ -1635,7 +1635,19 @@ class Stage:
             "Stage %s Torch profiler %s failed: %s", self.name, operation, detail
         )
 
-    def _on_profiler_start(self, msg: ProfilerStartMessage) -> None:
+    async def _delegate_profiler_to_scheduler(self, call: Callable[[], None]) -> None:
+        """Run a blocking scheduler handoff off the stage control loop.
+
+        Both the readiness wait and the admin queue handoff block for up to
+        ``_SCHEDULER_THREAD_READY_TIMEOUT_S`` each. This coroutine runs on the
+        loop that also serves submits and acks, so the wait goes to an executor
+        for the same reason :meth:`_run_admin_operation` does.
+        """
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, call)
+
+    async def _on_profiler_start(self, msg: ProfilerStartMessage) -> None:
         run_id = msg.run_id
         mode = self._torch_profiler_mode()
         route_to_scheduler = mode == _TORCH_PROFILER_SCHEDULER_OWNER
@@ -1647,7 +1659,9 @@ class Stage:
             if prof_dir and not os.path.isabs(template):
                 template = os.path.join(prof_dir, template)
             if route_to_scheduler:
-                self._start_torch_profiler_on_scheduler(template, run_id)
+                await self._delegate_profiler_to_scheduler(
+                    lambda: self._start_torch_profiler_on_scheduler(template, run_id)
+                )
             else:
                 TorchProfiler.start(template, run_id=run_id)
         if msg.event_dir is not None:
@@ -1715,7 +1729,7 @@ class Stage:
                 "stop", response.get("error", response.get("message"))
             )
 
-    def _on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
+    async def _on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
         # run_id=None is a wildcard (stop whatever's active).
         # Mirrors _on_profiler_start: only the process-local owner drives the
         # singleton, siblings stay out, ownerless processes stop their own.
@@ -1723,7 +1737,9 @@ class Stage:
         if mode == _TORCH_PROFILER_SCHEDULER_SIBLING:
             pass
         elif mode == _TORCH_PROFILER_SCHEDULER_OWNER:
-            self._stop_torch_profiler_on_scheduler(msg.run_id)
+            await self._delegate_profiler_to_scheduler(
+                lambda: self._stop_torch_profiler_on_scheduler(msg.run_id)
+            )
         elif TorchProfiler.is_active() and (
             msg.run_id is None or TorchProfiler.get_active_run_id() == msg.run_id
         ):

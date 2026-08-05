@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+from unittest import mock
+
 import pytest
 
 from sglang_omni.config.schema import (
@@ -584,3 +587,53 @@ def test_mp_runner_keeps_cpu_stage_without_gpu_identity(tmp_path) -> None:
 
     assert group.specs[0].gpu_id is None
     assert "gpu_id" not in group.specs[0].comm_config
+
+
+def test_scheduler_thread_flag_from_stage_env_defaults_requires_an_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The flag can be declared in pipeline/stage env config, which is injected
+    at spawn -- after this validation runs. Reading only the launcher env would
+    let an ownerless pipeline start with the flag silently doing nothing."""
+    monkeypatch.delenv("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD", raising=False)
+    group = StageGroup(
+        "test",
+        [
+            StageWorkerProcessSpec(
+                process_name="pipeline",
+                stage_specs=[
+                    StageLaunchConfig(
+                        stage_name="decode",
+                        env_defaults={"SGLANG_TORCH_PROFILER_SCHEDULER_THREAD": "1"},
+                    )
+                ],
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="requires at least one stage"):
+        _resolve_torch_profiler_ownership([group])
+
+
+def test_launcher_env_off_beats_stage_env_defaults() -> None:
+    """Spawn defaults only apply to keys absent from the launcher env, so an
+    explicit off must not be overridden by config."""
+    group = StageGroup(
+        "test",
+        [
+            StageWorkerProcessSpec(
+                process_name="pipeline",
+                stage_specs=[
+                    StageLaunchConfig(
+                        stage_name="decode",
+                        env_defaults={"SGLANG_TORCH_PROFILER_SCHEDULER_THREAD": "1"},
+                    )
+                ],
+            )
+        ],
+    )
+
+    with mock.patch.dict(
+        os.environ, {"SGLANG_TORCH_PROFILER_SCHEDULER_THREAD": "0"}, clear=False
+    ):
+        _resolve_torch_profiler_ownership([group])
