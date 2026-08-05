@@ -8,6 +8,7 @@ import queue
 import sys
 import threading
 import time
+from contextlib import suppress
 from types import SimpleNamespace
 from unittest import mock
 
@@ -22,6 +23,7 @@ from sglang_omni.proto import (
     AdminOperation,
     AdminResult,
     AdminResultMessage,
+    DataAckMessage,
     ProfilerStartMessage,
     ProfilerStopMessage,
     parse_message,
@@ -93,14 +95,41 @@ def _patch_direct_torch_profiler(
     )
 
 
+async def _release_profiler_lane(stage: Stage) -> None:
+    """Drain and tear down the profiler lane, as ``Stage.stop`` does.
+
+    Each helper below gets its own ``asyncio.run`` loop, and the queue and
+    worker are bound to the loop that created them. Production keeps one loop
+    for the stage's whole life; tests have to reset between calls.
+    """
+    await stage._wait_for_profiler_ops()
+    worker = stage._profiler_op_worker
+    if worker is not None:
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
+    stage._profiler_op_worker = None
+    stage._profiler_op_queue = None
+
+
 def _profile_start(stage: Stage, msg: ProfilerStartMessage) -> None:
-    """Drive the async profiler-start handler from a sync test."""
-    asyncio.run(stage._on_profiler_start(msg))
+    """Handle a start, then wait for the deferred profiler operation."""
+
+    async def _run() -> None:
+        stage._on_profiler_start(msg)
+        await _release_profiler_lane(stage)
+
+    asyncio.run(_run())
 
 
 def _profile_stop(stage: Stage, msg: ProfilerStopMessage) -> None:
-    """Drive the async profiler-stop handler from a sync test."""
-    asyncio.run(stage._on_profiler_stop(msg))
+    """Handle a stop, then wait for the deferred profiler operation."""
+
+    async def _run() -> None:
+        stage._on_profiler_stop(msg)
+        await _release_profiler_lane(stage)
+
+    asyncio.run(_run())
 
 
 def _profiler_stage(scheduler, *, name: str, owner: bool, process_has_owner: bool):
@@ -1124,12 +1153,12 @@ def test_live_profiler_request_carries_a_deadline_but_still_runs() -> None:
     assert started == ["/tmp/trace"]
 
 
-def test_profiler_delegation_does_not_block_the_stage_control_loop(
+def test_profiler_delegation_does_not_stall_submits_and_acks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The readiness wait and the admin handoff each block for up to 30s. They
-    run on the loop that also serves submits and acks, so they must go to an
-    executor rather than stalling message handling."""
+    """The readiness wait and the admin handoff each block for up to 30s. If a
+    handler awaited them, `run` would not reach its next `control_plane.recv()`
+    and this stage's submits and acks would queue behind a profiler request."""
     monkeypatch.setenv("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD", "1")
     direct_calls: list[tuple] = []
     _patch_direct_torch_profiler(monkeypatch, direct_calls)
@@ -1144,27 +1173,69 @@ def test_profiler_delegation_does_not_block_the_stage_control_loop(
     owner = _profiler_stage(
         _BlockingScheduler(), name="tts_engine", owner=True, process_has_owner=True
     )
+    handled: list[str] = []
 
     async def _run() -> None:
-        profiler = asyncio.ensure_future(
-            owner._on_profiler_start(
-                ProfilerStartMessage(
-                    run_id="run-1", trace_path_template="/tmp/{stage}/trace"
-                )
+        # Exactly what Stage.run does: dispatch, then take the next message.
+        await owner._handle_message(
+            ProfilerStartMessage(
+                run_id="run-1", trace_path_template="/tmp/{stage}/trace"
             )
         )
-        # The loop must keep turning while the delegation blocks in its thread.
-        served = 0
-        for _ in range(5):
-            await asyncio.sleep(0)
-            served += 1
-        assert not profiler.done()
-        assert served == 5
+        handled.append("profiler_start")
 
+        for index in range(3):
+            await owner._handle_message(
+                DataAckMessage(
+                    request_id=f"req-{index}",
+                    from_stage="upstream",
+                    to_stage="tts_engine",
+                    object_id=f"obj-{index}",
+                )
+            )
+            handled.append(f"ack-{index}")
+
+        # Submits and acks got through while the delegation was still blocked.
+        assert owner.scheduler.profiler_calls == []
         release.set()
-        await asyncio.wait_for(profiler, timeout=5.0)
+        await asyncio.wait_for(owner._wait_for_profiler_ops(), timeout=5.0)
+        await owner.stop()
 
     asyncio.run(_run())
+
+    assert handled == ["profiler_start", "ack-0", "ack-1", "ack-2"]
     assert owner.scheduler.profiler_calls == [
         ("start", f"/tmp/tts_engine/trace_pid{os.getpid()}", "run-1")
     ]
+
+
+def test_profiler_operations_run_in_arrival_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deferring the work must not let a stop overtake its own start."""
+    monkeypatch.setenv("SGLANG_TORCH_PROFILER_SCHEDULER_THREAD", "1")
+    direct_calls: list[tuple] = []
+    _patch_direct_torch_profiler(monkeypatch, direct_calls)
+
+    class _SlowStartScheduler(ProfilerControlScheduler):
+        def start_torch_profiler(self, trace_path_template: str, run_id: str | None):
+            time.sleep(0.05)
+            return super().start_torch_profiler(trace_path_template, run_id)
+
+    owner = _profiler_stage(
+        _SlowStartScheduler(), name="tts_engine", owner=True, process_has_owner=True
+    )
+
+    async def _run() -> None:
+        owner._on_profiler_start(
+            ProfilerStartMessage(
+                run_id="run-1", trace_path_template="/tmp/{stage}/trace"
+            )
+        )
+        owner._on_profiler_stop(ProfilerStopMessage(run_id="run-1"))
+        await asyncio.wait_for(owner._wait_for_profiler_ops(), timeout=5.0)
+        await owner.stop()
+
+    asyncio.run(_run())
+
+    assert [name for name, *_ in owner.scheduler.profiler_calls] == ["start", "stop"]

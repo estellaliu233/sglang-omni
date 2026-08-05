@@ -182,6 +182,8 @@ class Stage:
         self._nonlocal_stream_targets: dict[str, set[str]] = {}
         self._receive_tasks: set[asyncio.Task] = set()
         self._receive_lane_tails: dict[tuple[str, str], asyncio.Future[None]] = {}
+        self._profiler_op_queue: asyncio.Queue[Callable[[], None]] | None = None
+        self._profiler_op_worker: asyncio.Task | None = None
         self._scheduler_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._scheduler_crash_error: BaseException | None = None
@@ -253,6 +255,12 @@ class Stage:
         await asyncio.gather(*receive_tasks, return_exceptions=True)
         self._receive_tasks.clear()
         self._receive_lane_tails.clear()
+        profiler_worker = self._profiler_op_worker
+        if profiler_worker is not None:
+            profiler_worker.cancel()
+            with suppress(asyncio.CancelledError):
+                await profiler_worker
+            self._profiler_op_worker = None
         if self.scheduler is not None:
             try:
                 self.scheduler.stop()
@@ -338,9 +346,9 @@ class Stage:
         elif isinstance(msg, DataReadyMessage):
             self._schedule_receive_task(msg)
         elif isinstance(msg, ProfilerStartMessage):
-            await self._on_profiler_start(msg)
+            self._on_profiler_start(msg)
         elif isinstance(msg, ProfilerStopMessage):
-            await self._on_profiler_stop(msg)
+            self._on_profiler_stop(msg)
         elif isinstance(msg, AdminMessage):
             await self._on_admin(msg)
 
@@ -1635,19 +1643,55 @@ class Stage:
             "Stage %s Torch profiler %s failed: %s", self.name, operation, detail
         )
 
-    async def _delegate_profiler_to_scheduler(self, call: Callable[[], None]) -> None:
-        """Run a blocking scheduler handoff off the stage control loop.
+    def _submit_profiler_op(self, call: Callable[[], None]) -> None:
+        """Hand a blocking profiler operation to the serialized worker.
 
-        Both the readiness wait and the admin queue handoff block for up to
-        ``_SCHEDULER_THREAD_READY_TIMEOUT_S`` each. This coroutine runs on the
-        loop that also serves submits and acks, so the wait goes to an executor
-        for the same reason :meth:`_run_admin_operation` does.
+        The readiness wait and the admin handoff each block for up to
+        ``_SCHEDULER_THREAD_READY_TIMEOUT_S``. Awaiting them from a message
+        handler would keep :meth:`run` from reaching its next
+        ``control_plane.recv()``, parking this stage's submits and acks behind a
+        profiler request. Handlers therefore return immediately and the work
+        runs here. One queue with one worker preserves arrival order, so a stop
+        can never overtake the start it belongs to.
         """
 
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, call)
+        if self._profiler_op_queue is None:
+            self._profiler_op_queue = asyncio.Queue()
+        if self._profiler_op_worker is None or self._profiler_op_worker.done():
+            self._profiler_op_worker = asyncio.create_task(
+                self._run_profiler_ops(), name=f"profiler-ops-{self.name}"
+            )
+            self._profiler_op_worker.add_done_callback(
+                lambda task: self._on_background_task_done(task, "profiler ops")
+            )
+        self._profiler_op_queue.put_nowait(call)
 
-    async def _on_profiler_start(self, msg: ProfilerStartMessage) -> None:
+    async def _run_profiler_ops(self) -> None:
+        """Run queued profiler operations one at a time, off the event loop."""
+
+        queue = self._profiler_op_queue
+        assert queue is not None
+        loop = asyncio.get_running_loop()
+        while True:
+            call = await queue.get()
+            try:
+                await loop.run_in_executor(None, call)
+            except Exception:
+                logger.warning(
+                    "Stage %s profiler control operation failed",
+                    self.name,
+                    exc_info=True,
+                )
+            finally:
+                queue.task_done()
+
+    async def _wait_for_profiler_ops(self) -> None:
+        """Block until every queued profiler operation has run."""
+
+        if self._profiler_op_queue is not None:
+            await self._profiler_op_queue.join()
+
+    def _on_profiler_start(self, msg: ProfilerStartMessage) -> None:
         run_id = msg.run_id
         mode = self._torch_profiler_mode()
         route_to_scheduler = mode == _TORCH_PROFILER_SCHEDULER_OWNER
@@ -1659,7 +1703,7 @@ class Stage:
             if prof_dir and not os.path.isabs(template):
                 template = os.path.join(prof_dir, template)
             if route_to_scheduler:
-                await self._delegate_profiler_to_scheduler(
+                self._submit_profiler_op(
                     lambda: self._start_torch_profiler_on_scheduler(template, run_id)
                 )
             else:
@@ -1729,7 +1773,7 @@ class Stage:
                 "stop", response.get("error", response.get("message"))
             )
 
-    async def _on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
+    def _on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
         # run_id=None is a wildcard (stop whatever's active).
         # Mirrors _on_profiler_start: only the process-local owner drives the
         # singleton, siblings stay out, ownerless processes stop their own.
@@ -1737,7 +1781,7 @@ class Stage:
         if mode == _TORCH_PROFILER_SCHEDULER_SIBLING:
             pass
         elif mode == _TORCH_PROFILER_SCHEDULER_OWNER:
-            await self._delegate_profiler_to_scheduler(
+            self._submit_profiler_op(
                 lambda: self._stop_torch_profiler_on_scheduler(msg.run_id)
             )
         elif TorchProfiler.is_active() and (
